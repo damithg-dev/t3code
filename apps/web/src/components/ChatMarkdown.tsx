@@ -178,6 +178,9 @@ import { resolveLinkTarget } from "../browser/browserLinkTarget";
 interface ChatMarkdownProps {
   text: string;
   cwd: string | undefined;
+  // Multi-repo workspaces (#923): roots a file link's absolute path may live
+  // under, so the preview opens it against the owning repo, not just `cwd`.
+  repoRoots?: readonly string[] | undefined;
   threadRef?: ScopedThreadRef | undefined;
   /** Environment that owns non-thread markdown, such as a pull request panel. */
   environmentId?: EnvironmentId | undefined;
@@ -1023,12 +1026,14 @@ interface MarkdownFileLinkProps {
       absolute host path outside it, null when the panel cannot show the file. */
   panelPath: string | null;
   line?: number | undefined;
+  // Owning repo root for the open-in-preview path (multi-repo, #923).
+  fileRoot?: string | undefined;
   label: string;
   copyMarkdown: string;
   theme: "light" | "dark";
   threadRef?: ScopedThreadRef | undefined;
   onOpen?: ((targetPath: string) => Promise<AtomCommandResult<unknown, unknown>>) | undefined;
-  onOpenInPanel: (panelPath: string, line: number | undefined) => void;
+  onOpenInPanel: (panelPath: string, line: number | undefined, root?: string | undefined) => void;
   openInEditorMenuLabel: string;
   onOpenInBrowser?: (() => Promise<AtomCommandResult<unknown, unknown>>) | undefined;
   onOpenMedia?: (() => void) | undefined;
@@ -1586,6 +1591,7 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
   displayPath,
   panelPath,
   line,
+  fileRoot,
   label,
   copyMarkdown,
   theme,
@@ -1639,7 +1645,7 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
 
   const handleOpenInFilePreview = useCallback(() => {
     if (threadRef && panelPath) {
-      onOpenInPanel(panelPath, line);
+      onOpenInPanel(panelPath, line, fileRoot);
       return;
     }
     if (onOpenMedia) {
@@ -1647,7 +1653,7 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
       return;
     }
     handleOpenInEditor();
-  }, [handleOpenInEditor, line, onOpenInPanel, onOpenMedia, panelPath, threadRef]);
+  }, [fileRoot, handleOpenInEditor, line, onOpenInPanel, onOpenMedia, panelPath, threadRef]);
 
   const handleOpenInBrowser = useCallback(() => {
     if (!onOpenInBrowser) {
@@ -1937,6 +1943,7 @@ function areMarkdownFileLinkPropsEqual(
     previous.displayPath === next.displayPath &&
     previous.panelPath === next.panelPath &&
     previous.line === next.line &&
+    previous.fileRoot === next.fileRoot &&
     previous.label === next.label &&
     previous.copyMarkdown === next.copyMarkdown &&
     previous.theme === next.theme &&
@@ -1955,6 +1962,7 @@ function areMarkdownFileLinkPropsEqual(
 function ChatMarkdown({
   text,
   cwd,
+  repoRoots,
   threadRef,
   environmentId: explicitEnvironmentId,
   onTaskListChange,
@@ -2071,7 +2079,10 @@ function ChatMarkdown({
     [environmentId, openInEditor],
   );
   const diffThemeName = resolveDiffThemeName(resolvedTheme);
+  // Stable dep for the roots array: NUL-joined (paths never contain NUL).
+  const repoRootsKey = repoRoots ? repoRoots.join("\0") : "";
   const markdownFileLinkMetaByHref = useMemo(() => {
+    const roots = repoRootsKey ? repoRootsKey.split("\0") : undefined;
     const metaByHref = new Map<
       string,
       NonNullable<ReturnType<typeof resolveMarkdownFileLinkMeta>>
@@ -2079,13 +2090,13 @@ function ChatMarkdown({
     for (const href of extractMarkdownLinkHrefs(renderCodexFileCitationsAsMarkdown(text))) {
       const normalizedHref = normalizeMarkdownLinkHrefKey(href);
       if (metaByHref.has(normalizedHref)) continue;
-      const meta = resolveMarkdownFileLinkMeta(normalizedHref, cwd, imageBaseDir ?? cwd);
+      const meta = resolveMarkdownFileLinkMeta(normalizedHref, cwd, imageBaseDir ?? cwd, roots);
       if (meta) {
         metaByHref.set(normalizedHref, meta);
       }
     }
     return metaByHref;
-  }, [cwd, imageBaseDir, text]);
+  }, [cwd, imageBaseDir, repoRootsKey, text]);
   const inlineCodeFileLinkMetaByText = useMemo(() => {
     const metaByText = new Map<string, MarkdownFileLinkMeta>();
     for (const span of extractInlineCodeSpans(text)) {
@@ -2240,13 +2251,13 @@ function ChatMarkdown({
   // A bare filename resolves to the workspace root, which is rarely where the
   // file is, so ask the index before opening. Absolute host paths open as-is.
   const openFileInPanel = useCallback(
-    (panelPath: string, line: number | undefined) => {
+    (panelPath: string, line: number | undefined, root?: string | undefined) => {
       if (!threadRef) return;
       // Claimed on every open so a synchronous one supersedes a lookup already
       // in flight.
       const isLatestLookup = claimWorkspaceBasenameLookup();
       const openAt = (path: string) =>
-        useRightPanelStore.getState().openFile(threadRef, path, line);
+        useRightPanelStore.getState().openFile(threadRef, path, line, root);
       if (!cwd || !needsWorkspaceBasenameLookup(panelPath)) {
         openAt(panelPath);
         return;
