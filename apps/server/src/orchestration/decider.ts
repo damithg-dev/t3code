@@ -16,7 +16,6 @@ import {
   type OrchestrationCommandRejection,
 } from "./Errors.ts";
 import {
-  findThreadById,
   listThreadsByProjectId,
   requireActiveProjectWorkspaceRootAbsent,
   requireProject,
@@ -1202,15 +1201,26 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
 
     case "thread.session.rate-limit-set": {
       // A limit report is provider bookkeeping, not thread activity: it must
-      // never wake a settled thread, never move session.updatedAt (which would
-      // raise a snoozed thread's hand and reorder sidebars), and never write an
-      // event when nothing changed. A thread with no session has nowhere to
-      // record it, which is normal for limits reported between sessions.
-      const thread = findThreadById(readModel, command.threadId);
-      const session = thread?.session;
-      if (!session || (session.rateLimitResetsAt ?? null) === command.resetsAt) {
-        return [];
+      // never wake a settled thread and never move session.updatedAt, which
+      // would raise a snoozed thread's hand and reorder sidebars.
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      // A limit belongs to the session that hit it. Without one there is
+      // nowhere to record it, so this is a precondition rather than a no-op.
+      if (thread.session === null) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} has no session to record a usage limit on`,
+          }),
+        );
       }
+      // Re-reporting the same limit re-emits the session unchanged: the engine
+      // rejects zero-event commands, and providers repeat their rate-limit
+      // notification freely, so this has to stay a silent projected no-op.
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
@@ -1222,7 +1232,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         type: "thread.session-set",
         payload: {
           threadId: command.threadId,
-          session: { ...session, rateLimitResetsAt: command.resetsAt },
+          session: { ...thread.session, rateLimitResetsAt: command.resetsAt },
         },
       };
     }

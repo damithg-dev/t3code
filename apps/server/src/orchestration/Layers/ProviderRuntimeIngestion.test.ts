@@ -469,6 +469,74 @@ describe("ProviderRuntimeIngestion", () => {
     expect(restarted.session?.status).toBe("ready");
   });
 
+  it("ignores a usage limit reported by a provider the session is not bound to", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const resetsAt = "2026-01-01T05:00:00.000Z";
+    const readThreadSession = async () =>
+      (await harness.readModel()).threads.find((entry) => entry.id === asThreadId("thread-1"))
+        ?.session;
+
+    // The seeded session is bound to codex. An event still queued from a
+    // replaced claude session must not stamp its account state onto it.
+    harness.emit({
+      type: "account.rate-limits.updated",
+      eventId: asEventId("evt-rate-limits-foreign-driver"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      payload: { rateLimits: {}, limitResetsAt: resetsAt },
+    });
+    await harness.drain();
+    expect((await readThreadSession())?.rateLimitResetsAt ?? null).toBeNull();
+
+    // Same driver, different account: bind an instance, then replay the other.
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-instance"),
+      threadId: ThreadId.make("thread-1"),
+      session: {
+        threadId: ThreadId.make("thread-1"),
+        status: "ready",
+        providerName: "codex",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: now,
+      },
+      createdAt: now,
+    });
+
+    harness.emit({
+      type: "account.rate-limits.updated",
+      eventId: asEventId("evt-rate-limits-foreign-instance"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex_work"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      payload: { rateLimits: {}, limitResetsAt: resetsAt },
+    });
+    await harness.drain();
+    expect((await readThreadSession())?.rateLimitResetsAt ?? null).toBeNull();
+
+    // The bound instance's own report still lands, so the two skips above are
+    // about provider identity and not about the event being dropped wholesale.
+    harness.emit({
+      type: "account.rate-limits.updated",
+      eventId: asEventId("evt-rate-limits-bound-instance"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      payload: { rateLimits: {}, limitResetsAt: resetsAt },
+    });
+    await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.rateLimitResetsAt === resetsAt,
+    );
+  });
+
   it("applies provider session.state.changed transitions directly", async () => {
     const harness = await createHarness();
     const waitingAt = "2026-01-01T00:00:00.000Z";
