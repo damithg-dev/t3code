@@ -406,6 +406,10 @@ export const OrchestrationSession = Schema.Struct({
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   activeTurnId: Schema.NullOr(TurnId),
   lastError: Schema.NullOr(TrimmedNonEmptyString),
+  // When the provider last reported a usage limit it is still serving out of.
+  // Optional so payloads from pre-usage-limit servers still decode, and so a
+  // session write that knows nothing about limits leaves the value untouched.
+  rateLimitResetsAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   updatedAt: IsoDateTime,
 });
 export type OrchestrationSession = typeof OrchestrationSession.Type;
@@ -1164,6 +1168,19 @@ const ThreadSessionSetCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+/**
+ * Records the usage limit a provider reported for a thread's session. Narrow
+ * on purpose: a limit report is not session activity, so it must not replay a
+ * whole session struct, wake a settled thread, or move session.updatedAt.
+ */
+const ThreadSessionRateLimitSetCommand = Schema.Struct({
+  type: Schema.Literal("thread.session.rate-limit-set"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  resetsAt: Schema.NullOr(IsoDateTime),
+  createdAt: IsoDateTime,
+});
+
 const ThreadMessageAssistantDeltaCommand = Schema.Struct({
   type: Schema.Literal("thread.message.assistant.delta"),
   commandId: CommandId,
@@ -1278,6 +1295,7 @@ const ThreadPullRequestSyncCommand = Schema.Struct({
 const InternalOrchestrationCommand = Schema.Union([
   ThreadAutoSettleCommand,
   ThreadSessionSetCommand,
+  ThreadSessionRateLimitSetCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
   ThreadHistoryImportCommand,

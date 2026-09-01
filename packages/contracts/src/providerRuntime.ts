@@ -790,7 +790,18 @@ export type AccountUpdatedPayload = typeof AccountUpdatedPayload.Type;
  * consumer that folds it into the provider snapshot never sees driver shapes.
  */
 const AccountRateLimitsUpdatedPayload = Schema.Struct({
-  limits: ProviderUsageLimitsUpdate,
+  /**
+   * Normalized windows for the usage bars. Optional because an adapter may
+   * have nothing to add to the published snapshot yet still know the account
+   * is limited, which `limitResetsAt` alone reports.
+   */
+  limits: Schema.optional(ProviderUsageLimitsUpdate),
+  /**
+   * Adapter-normalized usage limit, tri-state: absent means the provider said
+   * nothing usable and known state must be left alone, null means it affirmed
+   * the account is not limited, and a timestamp means limited until then.
+   */
+  limitResetsAt: Schema.optional(Schema.NullOr(IsoDateTime)),
 });
 export type AccountRateLimitsUpdatedPayload = typeof AccountRateLimitsUpdatedPayload.Type;
 

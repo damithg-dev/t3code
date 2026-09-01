@@ -72,6 +72,7 @@ import {
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
 import { codexRateLimitsToUpdate } from "./codexUsageLimits.ts";
+import { rateLimitResetToIso } from "./rateLimitReset.ts";
 const isCodexAppServerProcessExitedError = Schema.is(CodexErrors.CodexAppServerProcessExitedError);
 const isCodexAppServerTransportError = Schema.is(CodexErrors.CodexAppServerTransportError);
 const isCodexSessionRuntimeThreadIdMissingError = Schema.is(
@@ -1981,15 +1982,40 @@ function mapToRuntimeEvents(
       EffectCodexSchema.V2AccountRateLimitsUpdatedNotification,
       event.payload,
     );
-    const limits = payload ? codexRateLimitsToUpdate(payload.rateLimits) : undefined;
-    if (!limits) {
+    if (!payload) {
+      return [];
+    }
+    const limits = codexRateLimitsToUpdate(payload.rateLimits);
+    // The notification already wraps the snapshot in `rateLimits`; forward the
+    // snapshot itself rather than nesting it a second time.
+    const snapshot = payload.rateLimits;
+    // Every exhausted window has to clear before the account serves again, so
+    // the account is limited until the LAST of them resets. ISO-8601 UTC
+    // strings compare chronologically.
+    const resetsAt = [snapshot.primary, snapshot.secondary]
+      .map((window) =>
+        window != null && window.usedPercent >= 100 ? rateLimitResetToIso(window.resetsAt) : null,
+      )
+      .reduce<string | null>(
+        (latest, value) => (value !== null && (latest === null || value > latest) ? value : latest),
+        null,
+      );
+    // Codex sends sparse rolling updates that explicitly "do not clear a
+    // previously observed value", so this adapter only ever reports a limit,
+    // never the absence of one. Staleness is bounded by the reset passing and
+    // by a fresh session starting clean.
+    const limited = snapshot.rateLimitReachedType != null && resetsAt !== null;
+    if (!limits && !limited) {
       return [];
     }
     return [
       {
         type: "account.rate-limits.updated",
         ...runtimeEventBase(event, canonicalThreadId),
-        payload: { limits },
+        payload: {
+          ...(limits ? { limits } : {}),
+          ...(limited ? { limitResetsAt: resetsAt } : {}),
+        },
       },
     ];
   }
