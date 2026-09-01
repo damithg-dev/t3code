@@ -97,13 +97,18 @@ it.layer(NodeServices.layer)("thread.session.rate-limit-set decider", (it) => {
     }),
   );
 
-  it.effect("emits nothing when the session already carries that reset", () =>
+  // The engine rejects zero-event commands, so a repeat report has to re-emit
+  // the session unchanged rather than decide nothing.
+  it.effect("re-emits an unchanged session when the reset already matches", () =>
     Effect.gen(function* () {
       const decided = yield* decideOrchestrationCommand({
         command: rateLimitCommand(RESETS_AT),
         readModel: makeReadModel({ session: makeSession(RESETS_AT) }),
       });
-      expect(Array.isArray(decided) ? decided : [decided]).toHaveLength(0);
+      const events = Array.isArray(decided) ? decided : [decided];
+      expect(events.map((event) => event.type)).toEqual(["thread.session-set"]);
+      if (events[0]?.type !== "thread.session-set") return;
+      expect(events[0].payload.session).toEqual(makeSession(RESETS_AT));
     }),
   );
 
@@ -113,30 +118,34 @@ it.layer(NodeServices.layer)("thread.session.rate-limit-set decider", (it) => {
         command: rateLimitCommand(null),
         readModel: makeReadModel({ session: makeSession(undefined) }),
       });
-      expect(Array.isArray(decided) ? decided : [decided]).toHaveLength(0);
+      const events = Array.isArray(decided) ? decided : [decided];
+      expect(events).toHaveLength(1);
+      if (events[0]?.type !== "thread.session-set") return;
+      expect(events[0].payload.session.rateLimitResetsAt).toBeNull();
+      expect(events[0].payload.session.updatedAt).toBe(SESSION_UPDATED_AT);
     }),
   );
 
-  it.effect("emits nothing when the thread has no session to record it on", () =>
+  it.effect("rejects a limit for a thread with no session to record it on", () =>
     Effect.gen(function* () {
-      const decided = yield* decideOrchestrationCommand({
+      const error = yield* decideOrchestrationCommand({
         command: rateLimitCommand(RESETS_AT),
         readModel: makeReadModel({ session: null }),
-      });
-      expect(Array.isArray(decided) ? decided : [decided]).toHaveLength(0);
+      }).pipe(Effect.flip);
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
     }),
   );
 
-  it.effect("emits nothing for a thread that does not exist", () =>
+  it.effect("rejects a limit for a thread that does not exist", () =>
     Effect.gen(function* () {
-      const decided = yield* decideOrchestrationCommand({
+      const error = yield* decideOrchestrationCommand({
         command: {
           ...rateLimitCommand(RESETS_AT),
           threadId: ThreadId.make("thread-missing"),
         },
         readModel: makeReadModel({}),
-      });
-      expect(Array.isArray(decided) ? decided : [decided]).toHaveLength(0);
+      }).pipe(Effect.flip);
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
     }),
   );
 
