@@ -22,7 +22,7 @@ import {
   TrimmedString,
   TurnId,
 } from "./baseSchemas.ts";
-import { ProviderInstanceId } from "./providerInstance.ts";
+import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -1088,11 +1088,16 @@ const ThreadSessionSetCommand = Schema.Struct({
  * Records the usage limit a provider reported for a thread's session. Narrow
  * on purpose: a limit report is not session activity, so it must not replay a
  * whole session struct, wake a settled thread, or move session.updatedAt.
+ *
+ * Carries the reporting provider's identity so the decider can reject a report
+ * that a provider or account switch has already outrun.
  */
 const ThreadSessionRateLimitSetCommand = Schema.Struct({
   type: Schema.Literal("thread.session.rate-limit-set"),
   commandId: CommandId,
   threadId: ThreadId,
+  provider: ProviderDriverKind,
+  providerInstanceId: Schema.optional(ProviderInstanceId),
   resetsAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
 });

@@ -15,7 +15,6 @@ import {
   TurnId,
   type OrchestrationCheckpointSummary,
   type OrchestrationProposedPlan,
-  type OrchestrationSession,
   type OrchestrationThread,
   type OrchestrationThreadActivity,
   type ProviderRuntimeEvent,
@@ -38,6 +37,7 @@ import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ThreadBackgroundLivenessService } from "../ThreadBackgroundLiveness.ts";
 import { ThreadPlanProgressService } from "../ThreadPlanProgress.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import { providerIdentityMatchesSession } from "../commandInvariants.ts";
 import {
   ProviderRuntimeIngestionService,
   type ProviderRuntimeIngestionShape,
@@ -131,28 +131,6 @@ function sameId(left: string | null | undefined, right: string | null | undefine
     return false;
   }
   return left === right;
-}
-
-/**
- * Whether a runtime event came from the provider the thread's session is bound
- * to now. Events queue behind the adapter that produced them, so switching
- * provider or account can leave one in flight whose account-wide state must
- * not be stamped onto the successor session.
- */
-function eventMatchesSessionProvider(
-  event: ProviderRuntimeEvent,
-  session: OrchestrationSession,
-): boolean {
-  if (session.providerName !== null && session.providerName !== event.provider) {
-    return false;
-  }
-  // Instance ids are optional on the wire during the driver/instance
-  // migration, so they only decide when both sides carry one.
-  return (
-    event.providerInstanceId === undefined ||
-    session.providerInstanceId === undefined ||
-    event.providerInstanceId === session.providerInstanceId
-  );
 }
 
 function hasAssistantMessageForTurn(
@@ -1710,11 +1688,13 @@ const make = Effect.gen(function* () {
       // A limit is account-wide state, but the composer banner lives on the
       // thread the user is reading, so it rides that thread's session. An
       // absent limitResetsAt means the provider said nothing usable.
+      // The identity check here is only a cheap filter on a snapshot; the
+      // decider repeats it against the session the write lands on.
       if (
         event.type === "account.rate-limits.updated" &&
         event.payload.limitResetsAt !== undefined &&
         thread.session !== null &&
-        eventMatchesSessionProvider(event, thread.session) &&
+        providerIdentityMatchesSession(event, thread.session) &&
         (thread.session.rateLimitResetsAt ?? null) !== event.payload.limitResetsAt
       ) {
         // Best-effort bookkeeping: the session can be replaced or stopped
@@ -1726,17 +1706,22 @@ const make = Effect.gen(function* () {
             type: "thread.session.rate-limit-set",
             commandId: yield* providerCommandId(event, "session-rate-limit-set"),
             threadId: thread.id,
+            provider: event.provider,
+            ...(event.providerInstanceId !== undefined
+              ? { providerInstanceId: event.providerInstanceId }
+              : {}),
             resetsAt: event.payload.limitResetsAt,
             createdAt: now,
           })
           .pipe(
-            Effect.catchTag("OrchestrationCommandInvariantError", (error) =>
-              Effect.logDebug("provider runtime ingestion skipped a usage limit update", {
-                eventId: event.eventId,
-                threadId: thread.id,
-                detail: error.detail,
-              }),
-            ),
+            Effect.catchTags({
+              OrchestrationCommandInvariantError: (error) =>
+                Effect.logDebug("provider runtime ingestion skipped a usage limit update", {
+                  eventId: event.eventId,
+                  threadId: thread.id,
+                  detail: error.detail,
+                }),
+            }),
           );
       }
 

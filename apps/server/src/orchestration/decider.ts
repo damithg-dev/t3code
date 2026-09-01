@@ -17,6 +17,7 @@ import {
 } from "./Errors.ts";
 import {
   listThreadsByProjectId,
+  providerIdentityMatchesSession,
   requireActiveProjectWorkspaceRootAbsent,
   requireProject,
   requireProjectAbsent,
@@ -1215,6 +1216,17 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           new OrchestrationCommandInvariantError({
             commandType: command.type,
             detail: `thread ${command.threadId} has no session to record a usage limit on`,
+          }),
+        );
+      }
+      // Checked here, against the session this write will land on, because a
+      // provider or account switch can commit between the reporter's own
+      // pre-check and this command reaching the decider.
+      if (!providerIdentityMatchesSession(command, thread.session)) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} session is bound to provider '${thread.session.providerName}' instance '${thread.session.providerInstanceId ?? "unknown"}', not the reporting '${command.provider}' instance '${command.providerInstanceId ?? "unknown"}'`,
           }),
         );
       }

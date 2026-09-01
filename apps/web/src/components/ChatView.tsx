@@ -1310,7 +1310,8 @@ function ChatViewContent(props: ChatViewProps) {
   const threadSyncPhase = routeKind === "server" ? (props.threadSyncPhase ?? null) : null;
   const threadDetailLoading = threadSyncPhase === "loading";
   const handleNewThread = useNewThreadHandler();
-  const { settleThread, pinThread, confirmAndUnpinThread, snoozeThread } = useThreadActions();
+  const { settleThread, pinThread, confirmAndUnpinThread, snoozeThread, unsnoozeThread } =
+    useThreadActions();
   const routeThreadRef = useMemo(
     () => scopeThreadRef(environmentId, threadId),
     [environmentId, threadId],
@@ -4958,8 +4959,23 @@ function ChatViewContent(props: ChatViewProps) {
           timeout: 5_000,
           actionProps: {
             children: "Undo",
+            // Undo targets the thread that was snoozed, not whatever is open
+            // when it is clicked: this toast outlives navigation by 5s, and
+            // handleUnsnoozeActiveThread resolves the active thread on click.
             onClick: () => {
-              void handleUnsnoozeActiveThread();
+              void unsnoozeThread(threadRef).then((undone) => {
+                if (undone._tag === "Failure" && !isAtomCommandInterrupted(undone)) {
+                  const undoError = squashAtomCommandFailure(undone);
+                  toastManager.add(
+                    stackedThreadToast({
+                      type: "error",
+                      title: "Failed to wake thread",
+                      description:
+                        undoError instanceof Error ? undoError.message : "An error occurred.",
+                    }),
+                  );
+                }
+              });
             },
           },
         }),
@@ -4967,7 +4983,7 @@ function ChatViewContent(props: ChatViewProps) {
     } finally {
       setSnoozingUsageLimitKey((current) => (current === threadKey ? null : current));
     }
-  }, [activeThreadRef, handleUnsnoozeActiveThread, snoozeThread, timestampFormat, usageLimitOffer]);
+  }, [activeThreadRef, snoozeThread, timestampFormat, unsnoozeThread, usageLimitOffer]);
   const [isRestoringThreadBranch, setIsRestoringThreadBranch] = useState(false);
   const [branchRestoreConfirmOpen, setBranchRestoreConfirmOpen] = useState(false);
   // Once revealed for a given mismatch, the banner stays mounted until the

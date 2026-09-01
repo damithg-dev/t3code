@@ -1,6 +1,7 @@
 import {
   CommandId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   type OrchestrationReadModel,
@@ -17,12 +18,18 @@ const NOW = "2026-01-01T00:00:00.000Z";
 const SESSION_UPDATED_AT = "2026-01-01T00:00:10.000Z";
 const RESETS_AT = "2026-01-01T05:00:00.000Z";
 
-function makeSession(rateLimitResetsAt?: string | null): OrchestrationSession {
+function makeSession(
+  rateLimitResetsAt?: string | null,
+  identity?: { readonly providerName?: string; readonly providerInstanceId?: string | null },
+): OrchestrationSession {
+  // null means "session carries no instance id", so it must survive the default.
+  const instanceId =
+    identity?.providerInstanceId === undefined ? "codex" : identity.providerInstanceId;
   return {
     threadId: ThreadId.make("thread-1"),
     status: "ready",
-    providerName: "codex",
-    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerName: identity?.providerName ?? "codex",
+    ...(instanceId === null ? {} : { providerInstanceId: ProviderInstanceId.make(instanceId) }),
     runtimeMode: "full-access",
     activeTurnId: null,
     lastError: null,
@@ -68,11 +75,18 @@ function makeReadModel(input: {
   };
 }
 
-function rateLimitCommand(resetsAt: string | null) {
+function rateLimitCommand(
+  resetsAt: string | null,
+  identity?: { readonly provider?: string; readonly providerInstanceId?: string },
+) {
   return {
     type: "thread.session.rate-limit-set",
     commandId: CommandId.make("cmd-rate-limit"),
     threadId: ThreadId.make("thread-1"),
+    provider: ProviderDriverKind.make(identity?.provider ?? "codex"),
+    ...(identity?.providerInstanceId === undefined
+      ? {}
+      : { providerInstanceId: ProviderInstanceId.make(identity.providerInstanceId) }),
     resetsAt,
     createdAt: NOW,
   } as const;
@@ -133,6 +147,70 @@ it.layer(NodeServices.layer)("thread.session.rate-limit-set decider", (it) => {
         readModel: makeReadModel({ session: null }),
       }).pipe(Effect.flip);
       expect(error._tag).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
+
+  // The reporter's own pre-check runs on a snapshot; a provider or account
+  // switch can commit before the command lands, so the decider re-checks
+  // against the session the write would actually touch.
+  it.effect("rejects a limit reported by a different provider driver", () =>
+    Effect.gen(function* () {
+      const error = yield* decideOrchestrationCommand({
+        command: rateLimitCommand(RESETS_AT, { provider: "claudeAgent" }),
+        readModel: makeReadModel({}),
+      }).pipe(Effect.flip);
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
+
+  it.effect("rejects a limit reported by a different instance of the same driver", () =>
+    Effect.gen(function* () {
+      const error = yield* decideOrchestrationCommand({
+        command: rateLimitCommand(RESETS_AT, { providerInstanceId: "codex_work" }),
+        readModel: makeReadModel({}),
+      }).pipe(Effect.flip);
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
+
+  it.effect("writes when the reporting instance matches the bound one", () =>
+    Effect.gen(function* () {
+      const decided = yield* decideOrchestrationCommand({
+        command: rateLimitCommand(RESETS_AT, { providerInstanceId: "codex" }),
+        readModel: makeReadModel({}),
+      });
+      const events = Array.isArray(decided) ? decided : [decided];
+      expect(events.map((event) => event.type)).toEqual(["thread.session-set"]);
+    }),
+  );
+
+  // Instance ids are optional during the driver/instance migration, so a
+  // missing one on either side must not block the write.
+  it.effect("writes when either side carries no instance id", () =>
+    Effect.gen(function* () {
+      const withoutCommandInstance = yield* decideOrchestrationCommand({
+        command: rateLimitCommand(RESETS_AT),
+        readModel: makeReadModel({}),
+      });
+      expect(
+        (Array.isArray(withoutCommandInstance)
+          ? withoutCommandInstance
+          : [withoutCommandInstance]
+        ).map((event) => event.type),
+      ).toEqual(["thread.session-set"]);
+
+      const withoutSessionInstance = yield* decideOrchestrationCommand({
+        command: rateLimitCommand(RESETS_AT, { providerInstanceId: "codex_work" }),
+        readModel: makeReadModel({
+          session: makeSession(null, { providerInstanceId: null }),
+        }),
+      });
+      expect(
+        (Array.isArray(withoutSessionInstance)
+          ? withoutSessionInstance
+          : [withoutSessionInstance]
+        ).map((event) => event.type),
+      ).toEqual(["thread.session-set"]);
     }),
   );
 
