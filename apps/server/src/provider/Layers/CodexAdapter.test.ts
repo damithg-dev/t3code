@@ -1700,6 +1700,84 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("takes the latest reset among exhausted windows", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      yield* runtime.emit({
+        id: asEventId("evt-rate-limits"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "account/rateLimits/updated",
+        payload: {
+          rateLimits: {
+            rateLimitReachedType: "rate_limit_reached",
+            // Seconds since the epoch. The exhausted window resets later than
+            // the window that still has headroom, and it is the one that has
+            // to clear before the account serves again.
+            primary: { usedPercent: 100, resetsAt: 1_772_240_400 },
+            secondary: { usedPercent: 80, resetsAt: 1_772_236_800 },
+          },
+        },
+      } satisfies ProviderEvent);
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+
+      NodeAssert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.type, "account.rate-limits.updated");
+      if (firstEvent.value.type !== "account.rate-limits.updated") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.payload.limitResetsAt, "2026-02-28T01:00:00.000Z");
+      NodeAssert.deepEqual(
+        firstEvent.value.payload.limits?.windows.map((window) => window.id),
+        ["primary", "secondary"],
+      );
+    }),
+  );
+
+  it.effect("never clears a limit from a sparse rolling update", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
+        Effect.forkChild,
+      );
+
+      const snapshots = [
+        // Sparse update with no reached type: says nothing about being limited.
+        { primary: { usedPercent: 12, resetsAt: 1_772_236_800 } },
+        // Credit depletion carries no window reset to snooze until.
+        { rateLimitReachedType: "workspace_owner_credits_depleted", primary: { usedPercent: 100 } },
+        // Reached, but every window still has headroom: no usable reset.
+        { rateLimitReachedType: "rate_limit_reached", primary: { usedPercent: 40 } },
+      ];
+      for (const [index, rateLimits] of snapshots.entries()) {
+        yield* runtime.emit({
+          id: asEventId(`evt-rate-limits-sparse-${index}`),
+          kind: "notification",
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId("thread-1"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          method: "account/rateLimits/updated",
+          payload: { rateLimits },
+        } satisfies ProviderEvent);
+      }
+
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      NodeAssert.equal(events.length, 3);
+      for (const event of events) {
+        NodeAssert.equal(event.type, "account.rate-limits.updated");
+        NodeAssert.equal("limitResetsAt" in event.payload, false);
+      }
+    }),
+  );
+
   it.effect("maps retryable Codex error notifications to runtime.warning", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

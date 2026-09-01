@@ -1703,6 +1703,11 @@ const make = Effect.gen(function* () {
               : status === "ready" || status === "interrupted"
                 ? null
                 : (thread.session?.lastError ?? null);
+        // Mid-session writes carry the reported limit forward; a provider
+        // announcing a new session starts clean, so a limit left over from a
+        // different provider or account cannot outlive the session that hit it.
+        const rateLimitResetsAt =
+          event.type === "session.started" ? null : (thread.session?.rateLimitResetsAt ?? null);
 
         if (shouldApplyThreadLifecycle) {
           if (event.type === "turn.started" && acceptedTurnStartedSourcePlan !== null) {
@@ -1739,11 +1744,30 @@ const make = Effect.gen(function* () {
               runtimeMode: thread.session?.runtimeMode ?? "full-access",
               activeTurnId: nextActiveTurnId,
               lastError,
+              rateLimitResetsAt,
               updatedAt: now,
             },
             createdAt: now,
           });
         }
+      }
+
+      // A limit is account-wide state, but the composer banner lives on the
+      // thread the user is reading, so it rides that thread's session. An
+      // absent limitResetsAt means the provider said nothing usable; the
+      // decider drops the rest as a no-op when the value already matches.
+      if (
+        event.type === "account.rate-limits.updated" &&
+        event.payload.limitResetsAt !== undefined &&
+        (thread.session?.rateLimitResetsAt ?? null) !== event.payload.limitResetsAt
+      ) {
+        yield* orchestrationEngine.dispatch({
+          type: "thread.session.rate-limit-set",
+          commandId: yield* providerCommandId(event, "session-rate-limit-set"),
+          threadId: thread.id,
+          resetsAt: event.payload.limitResetsAt,
+          createdAt: now,
+        });
       }
 
       const assistantDelta =
@@ -2031,6 +2055,7 @@ const make = Effect.gen(function* () {
               runtimeMode: thread.session?.runtimeMode ?? "full-access",
               activeTurnId: eventTurnId ?? null,
               lastError: runtimeErrorMessage,
+              rateLimitResetsAt: thread.session?.rateLimitResetsAt ?? null,
               updatedAt: now,
             },
             createdAt: now,

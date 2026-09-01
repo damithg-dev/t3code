@@ -349,6 +349,7 @@ function mapSessionRow(
     runtimeMode: row.runtimeMode,
     activeTurnId: row.activeTurnId,
     lastError: row.lastError,
+    ...(row.rateLimitResetsAt !== null ? { rateLimitResetsAt: row.rateLimitResetsAt } : {}),
     updatedAt: row.updatedAt,
   };
 }
@@ -688,6 +689,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           runtime_mode AS "runtimeMode",
           active_turn_id AS "activeTurnId",
           last_error AS "lastError",
+          rate_limit_resets_at AS "rateLimitResetsAt",
           updated_at AS "updatedAt"
         FROM projection_thread_sessions
         ORDER BY thread_id ASC
@@ -709,6 +711,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           sessions.runtime_mode AS "runtimeMode",
           sessions.active_turn_id AS "activeTurnId",
           sessions.last_error AS "lastError",
+          sessions.rate_limit_resets_at AS "rateLimitResetsAt",
           sessions.updated_at AS "updatedAt"
         FROM projection_thread_sessions sessions
         INNER JOIN projection_threads threads
@@ -734,6 +737,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           sessions.runtime_mode AS "runtimeMode",
           sessions.active_turn_id AS "activeTurnId",
           sessions.last_error AS "lastError",
+          sessions.rate_limit_resets_at AS "rateLimitResetsAt",
           sessions.updated_at AS "updatedAt"
         FROM projection_thread_sessions sessions
         INNER JOIN projection_threads threads
@@ -1323,6 +1327,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           runtime_mode AS "runtimeMode",
           active_turn_id AS "activeTurnId",
           last_error AS "lastError",
+          rate_limit_resets_at AS "rateLimitResetsAt",
           updated_at AS "updatedAt"
         FROM projection_thread_sessions
         WHERE thread_id = ${threadId}
@@ -1976,18 +1981,7 @@ pending_approval_requests AS (
 
               for (const row of sessionRows) {
                 updatedAt = maxIso(updatedAt, row.updatedAt);
-                sessionsByThread.set(row.threadId, {
-                  threadId: row.threadId,
-                  status: row.status,
-                  providerName: row.providerName,
-                  ...(row.providerInstanceId !== null
-                    ? { providerInstanceId: row.providerInstanceId }
-                    : {}),
-                  runtimeMode: row.runtimeMode,
-                  activeTurnId: row.activeTurnId,
-                  lastError: row.lastError,
-                  updatedAt: row.updatedAt,
-                });
+                sessionsByThread.set(row.threadId, mapSessionRow(row));
               }
 
               const repositoryIdentities = yield* resolveRepositoryIdentitiesForProjects(
@@ -2524,43 +2518,41 @@ pending_approval_requests AS (
                     )
                   : Result.failVoid,
               ),
-              threads: threadRows.map(
-                (row): OrchestrationThreadShell => ({
-                  id: row.threadId,
-                  projectId: row.projectId,
-                  title: row.title,
-                  modelSelection: row.modelSelection,
-                  runtimeMode: row.runtimeMode,
-                  interactionMode: row.interactionMode,
-                  branch: row.branch,
-                  worktreePath: row.worktreePath,
-                  ...(row.linkedPullRequest === null
-                    ? {}
-                    : { linkedPullRequest: row.linkedPullRequest }),
-                  worktrees: row.worktrees,
-                  latestTurn: latestTurnByThread.get(row.threadId) ?? null,
-                  createdAt: row.createdAt,
-                  updatedAt: row.updatedAt,
-                  archivedAt: row.archivedAt,
-                  settledOverride: row.settledOverride,
-                  settledAt: row.settledAt,
-                  unsettledAt: row.unsettledAt,
-                  snoozedUntil: row.snoozedUntil,
-                  snoozedAt: row.snoozedAt,
-                  pinnedAt: row.pinnedAt,
-                  pinOrderKey: row.pinOrderKey ?? null,
-                  titleRegeneration: mapTitleRegeneration(row),
-                  session: sessionByThread.get(row.threadId) ?? null,
-                  latestUserMessageAt: row.latestUserMessageAt,
-                  hasPendingApprovals: row.pendingApprovalCount > 0,
-                  hasPendingUserInput: row.pendingUserInputCount > 0,
-                  hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
-                  backgroundLiveness: threadBackgroundLiveness.getThreadBackgroundLiveness(
-                    row.threadId,
-                  ),
-                  planProgress: threadPlanProgress.getThreadPlanProgress(row.threadId),
-                }),
-              ),
+              threads: threadRows.map((row): OrchestrationThreadShell => ({
+                id: row.threadId,
+                projectId: row.projectId,
+                title: row.title,
+                modelSelection: row.modelSelection,
+                runtimeMode: row.runtimeMode,
+                interactionMode: row.interactionMode,
+                branch: row.branch,
+                worktreePath: row.worktreePath,
+                ...(row.linkedPullRequest === null
+                  ? {}
+                  : { linkedPullRequest: row.linkedPullRequest }),
+                worktrees: row.worktrees,
+                latestTurn: latestTurnByThread.get(row.threadId) ?? null,
+                createdAt: row.createdAt,
+                updatedAt: row.updatedAt,
+                archivedAt: row.archivedAt,
+                settledOverride: row.settledOverride,
+                settledAt: row.settledAt,
+                unsettledAt: row.unsettledAt,
+                snoozedUntil: row.snoozedUntil,
+                snoozedAt: row.snoozedAt,
+                pinnedAt: row.pinnedAt,
+                pinOrderKey: row.pinOrderKey ?? null,
+                titleRegeneration: mapTitleRegeneration(row),
+                session: sessionByThread.get(row.threadId) ?? null,
+                latestUserMessageAt: row.latestUserMessageAt,
+                hasPendingApprovals: row.pendingApprovalCount > 0,
+                hasPendingUserInput: row.pendingUserInputCount > 0,
+                hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
+                backgroundLiveness: threadBackgroundLiveness.getThreadBackgroundLiveness(
+                  row.threadId,
+                ),
+                planProgress: threadPlanProgress.getThreadPlanProgress(row.threadId),
+              })),
               updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
             };
 
@@ -2604,12 +2596,10 @@ pending_approval_requests AS (
           "ProjectionSnapshotQuery.getCounts:decodeRow",
         ),
       ),
-      Effect.map(
-        (row): ProjectionSnapshotCounts => ({
-          projectCount: row.projectCount,
-          threadCount: row.threadCount,
-        }),
-      ),
+      Effect.map((row): ProjectionSnapshotCounts => ({
+        projectCount: row.projectCount,
+        threadCount: row.threadCount,
+      })),
     );
 
   const getEventReplayStats: ProjectionSnapshotQueryShape["getEventReplayStats"] = (input) =>
@@ -2620,12 +2610,10 @@ pending_approval_requests AS (
           "ProjectionSnapshotQuery.getEventReplayStats:decodeRow",
         ),
       ),
-      Effect.map(
-        (row): ProjectionEventReplayStats => ({
-          eventCount: row.eventCount,
-          payloadBytes: row.payloadBytes,
-        }),
-      ),
+      Effect.map((row): ProjectionEventReplayStats => ({
+        eventCount: row.eventCount,
+        payloadBytes: row.payloadBytes,
+      })),
     );
 
   const searchThreads: ProjectionSnapshotQueryShape["searchThreads"] = Effect.fn(
@@ -2761,17 +2749,15 @@ pending_approval_requests AS (
             : [threadRow.value.workspaceRoot],
         worktreePath: threadRow.value.worktreePath,
         worktrees: threadRow.value.worktrees,
-        checkpoints: checkpointRows.map(
-          (row): OrchestrationCheckpointSummary => ({
-            turnId: row.turnId,
-            checkpointTurnCount: row.checkpointTurnCount,
-            checkpointRef: row.checkpointRef,
-            status: row.status,
-            files: row.files,
-            assistantMessageId: row.assistantMessageId,
-            completedAt: row.completedAt,
-          }),
-        ),
+        checkpoints: checkpointRows.map((row): OrchestrationCheckpointSummary => ({
+          turnId: row.turnId,
+          checkpointTurnCount: row.checkpointTurnCount,
+          checkpointRef: row.checkpointRef,
+          status: row.status,
+          files: row.files,
+          assistantMessageId: row.assistantMessageId,
+          completedAt: row.completedAt,
+        })),
       });
     });
 

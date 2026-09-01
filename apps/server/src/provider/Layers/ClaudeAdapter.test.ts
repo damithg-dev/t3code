@@ -1329,6 +1329,63 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("normalizes SDK rate limit events into a tri-state limit reset", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "account.rate-limits.updated"),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      // `rateLimitType` and `utilization` are what the window normalizer needs;
+      // the reset fields are what this test is about.
+      const window = { rateLimitType: "five_hour", utilization: 1 };
+      const rateLimitInfos = [
+        // Claude reports seconds since the epoch.
+        { ...window, status: "rejected", resetsAt: 1_772_236_800 },
+        // Overage rejections carry their reset on the overage field only.
+        { ...window, status: "rejected", overageResetsAt: 1_772_240_400 },
+        // Rejected with no reset at all: unknown, must not clobber.
+        { ...window, status: "rejected" },
+        { ...window, status: "allowed", utilization: 0.5 },
+      ];
+      for (const [index, rate_limit_info] of rateLimitInfos.entries()) {
+        harness.query.emit({
+          type: "rate_limit_event",
+          session_id: "sdk-session-1",
+          uuid: `rate-limit-${index}`,
+          rate_limit_info,
+        } as unknown as SDKMessage);
+      }
+
+      const payloads = Array.from(yield* Fiber.join(runtimeEventsFiber)).map((event) => {
+        assert.equal(event.type, "account.rate-limits.updated");
+        if (event.type !== "account.rate-limits.updated") {
+          throw new Error("expected account.rate-limits.updated");
+        }
+        return event.payload;
+      });
+
+      assert.equal(payloads[0]?.limitResetsAt, "2026-02-28T00:00:00.000Z");
+      assert.equal(payloads[1]?.limitResetsAt, "2026-02-28T01:00:00.000Z");
+      assert.equal(payloads[2] !== undefined && "limitResetsAt" in payloads[2], false);
+      assert.equal(payloads[3]?.limitResetsAt, null);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("does not emit turn.completed for a result with no active turn", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

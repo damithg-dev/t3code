@@ -620,6 +620,100 @@ describe("ProviderRuntimeIngestion", () => {
     });
   });
 
+  it("records a reported usage limit on the session and keeps it across lifecycle writes", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "account.rate-limits.updated",
+      eventId: asEventId("evt-rate-limits-reached"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      payload: { limitResetsAt: "2026-01-01T05:00:00.000Z" },
+    });
+
+    await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.rateLimitResetsAt === "2026-01-01T05:00:00.000Z",
+    );
+
+    // A lifecycle write that knows nothing about limits must not clear it.
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-rate-limits-turn-started"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      turnId: asTurnId("turn-1"),
+    });
+
+    const running = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.status === "running",
+    );
+    expect(running.session?.rateLimitResetsAt).toBe("2026-01-01T05:00:00.000Z");
+
+    // A provider that says nothing usable must leave the known limit alone.
+    harness.emit({
+      type: "account.rate-limits.updated",
+      eventId: asEventId("evt-rate-limits-silent"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      payload: {},
+    });
+
+    harness.emit({
+      type: "account.rate-limits.updated",
+      eventId: asEventId("evt-rate-limits-cleared"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      payload: { limitResetsAt: null },
+    });
+
+    const cleared = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.rateLimitResetsAt == null,
+    );
+    expect(cleared.session?.status).toBe("running");
+  });
+
+  it("clears a stale usage limit when the provider announces a fresh session", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "account.rate-limits.updated",
+      eventId: asEventId("evt-fresh-session-rate-limits"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      payload: { limitResetsAt: "2026-01-01T05:00:00.000Z" },
+    });
+
+    await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.rateLimitResetsAt === "2026-01-01T05:00:00.000Z",
+    );
+
+    harness.emit({
+      type: "session.started",
+      eventId: asEventId("evt-fresh-session-started"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      payload: {},
+    });
+
+    const restarted = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.rateLimitResetsAt == null,
+    );
+    expect(restarted.session?.status).toBe("ready");
+  });
+
   it("applies provider session.state.changed transitions directly", async () => {
     const harness = await createHarness();
     const waitingAt = "2026-01-01T00:00:00.000Z";

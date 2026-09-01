@@ -109,6 +109,7 @@ import {
 } from "../Errors.ts";
 import { type ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
+import { rateLimitResetToIso } from "./rateLimitReset.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
@@ -192,12 +193,10 @@ function toSessionPermissionUpdates(
   toolName: string,
   suggestions: ReadonlyArray<PermissionUpdate> | undefined,
 ): Array<PermissionUpdate> {
-  const sessionScoped = (suggestions ?? []).map(
-    (suggestion): PermissionUpdate => ({
-      ...suggestion,
-      destination: "session",
-    }),
-  );
+  const sessionScoped = (suggestions ?? []).map((suggestion): PermissionUpdate => ({
+    ...suggestion,
+    destination: "session",
+  }));
   if (sessionScoped.length > 0) {
     return sessionScoped;
   }
@@ -3862,11 +3861,20 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ? yield* Ref.get(options.scopedLimitNames)
         : { overageIncluded: undefined };
       const limits = claudeRateLimitEventToUpdate(rateLimitInfo, names);
-      if (limits) {
+      // Claude reports the full state each time, so "not rejected" is a
+      // trustworthy clear. A rejection whose reset is missing is not: it must
+      // not overwrite a reset we already know with "unknown".
+      const limitResetsAt =
+        rateLimitInfo.status === "rejected"
+          ? rateLimitResetToIso(rateLimitInfo.resetsAt ?? rateLimitInfo.overageResetsAt)
+          : null;
+      const resetsAtPayload =
+        rateLimitInfo.status === "rejected" && limitResetsAt === null ? {} : { limitResetsAt };
+      if (limits || "limitResetsAt" in resetsAtPayload) {
         yield* offerRuntimeEvent({
           ...base,
           type: "account.rate-limits.updated",
-          payload: { limits },
+          payload: { ...(limits ? { limits } : {}), ...resetsAtPayload },
         });
       }
       // A rejected window parks the turn inside the SDK: no further messages
