@@ -15,6 +15,7 @@ import {
   TurnId,
   type OrchestrationCheckpointSummary,
   type OrchestrationProposedPlan,
+  type OrchestrationSession,
   type OrchestrationThread,
   type OrchestrationThreadActivity,
   type ProviderRuntimeEvent,
@@ -136,6 +137,28 @@ function sameId(left: string | null | undefined, right: string | null | undefine
     return false;
   }
   return left === right;
+}
+
+/**
+ * Whether a runtime event came from the provider the thread's session is bound
+ * to now. Events queue behind the adapter that produced them, so switching
+ * provider or account can leave one in flight whose account-wide state must
+ * not be stamped onto the successor session.
+ */
+function eventMatchesSessionProvider(
+  event: ProviderRuntimeEvent,
+  session: OrchestrationSession,
+): boolean {
+  if (session.providerName !== null && session.providerName !== event.provider) {
+    return false;
+  }
+  // Instance ids are optional on the wire during the driver/instance
+  // migration, so they only decide when both sides carry one.
+  return (
+    event.providerInstanceId === undefined ||
+    session.providerInstanceId === undefined ||
+    event.providerInstanceId === session.providerInstanceId
+  );
 }
 
 function hasAssistantMessageForTurn(
@@ -1754,20 +1777,35 @@ const make = Effect.gen(function* () {
 
       // A limit is account-wide state, but the composer banner lives on the
       // thread the user is reading, so it rides that thread's session. An
-      // absent limitResetsAt means the provider said nothing usable; the
-      // decider drops the rest as a no-op when the value already matches.
+      // absent limitResetsAt means the provider said nothing usable.
       if (
         event.type === "account.rate-limits.updated" &&
         event.payload.limitResetsAt !== undefined &&
-        (thread.session?.rateLimitResetsAt ?? null) !== event.payload.limitResetsAt
+        thread.session !== null &&
+        eventMatchesSessionProvider(event, thread.session) &&
+        (thread.session.rateLimitResetsAt ?? null) !== event.payload.limitResetsAt
       ) {
-        yield* orchestrationEngine.dispatch({
-          type: "thread.session.rate-limit-set",
-          commandId: yield* providerCommandId(event, "session-rate-limit-set"),
-          threadId: thread.id,
-          resetsAt: event.payload.limitResetsAt,
-          createdAt: now,
-        });
+        // Best-effort bookkeeping: the session can be replaced or stopped
+        // between this read and the dispatch, and a limit lost to that race
+        // self-heals on the provider's next report. It must never fail the
+        // ingestion stream.
+        yield* orchestrationEngine
+          .dispatch({
+            type: "thread.session.rate-limit-set",
+            commandId: yield* providerCommandId(event, "session-rate-limit-set"),
+            threadId: thread.id,
+            resetsAt: event.payload.limitResetsAt,
+            createdAt: now,
+          })
+          .pipe(
+            Effect.catchTag("OrchestrationCommandInvariantError", (error) =>
+              Effect.logDebug("provider runtime ingestion skipped a usage limit update", {
+                eventId: event.eventId,
+                threadId: thread.id,
+                detail: error.detail,
+              }),
+            ),
+          );
       }
 
       const assistantDelta =
