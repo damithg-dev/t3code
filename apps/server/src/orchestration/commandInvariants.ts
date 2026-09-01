@@ -2,8 +2,11 @@ import type {
   OrchestrationCommand,
   OrchestrationProject,
   OrchestrationReadModel,
+  OrchestrationSession,
   OrchestrationThread,
   ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
@@ -23,6 +26,31 @@ export function findThreadById(
   threadId: ThreadId,
 ): OrchestrationThread | undefined {
   return readModel.threads.find((thread) => thread.id === threadId);
+}
+
+/**
+ * Whether a report from a provider identity still applies to the session it
+ * would be written to. Provider work queues behind the adapter that produced
+ * it, so switching provider or account can leave a report in flight whose
+ * account-wide state must not land on the successor session.
+ */
+export function providerIdentityMatchesSession(
+  identity: {
+    readonly provider: ProviderDriverKind;
+    readonly providerInstanceId?: ProviderInstanceId | undefined;
+  },
+  session: OrchestrationSession,
+): boolean {
+  if (session.providerName !== null && session.providerName !== identity.provider) {
+    return false;
+  }
+  // Instance ids are optional on the wire during the driver/instance
+  // migration, so they only decide when both sides carry one.
+  return (
+    identity.providerInstanceId === undefined ||
+    session.providerInstanceId === undefined ||
+    identity.providerInstanceId === session.providerInstanceId
+  );
 }
 
 export function findProjectById(
