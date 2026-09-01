@@ -11,6 +11,7 @@ import {
   snoozeWakeLabel,
   threadRaisedHandWhileSnoozed,
   threadWokeAt,
+  usageLimitSnoozeOffer,
   type ThreadSnoozeShell,
 } from "./threadSettled.ts";
 import type { OrchestrationThreadShell } from "@t3tools/contracts";
@@ -28,6 +29,7 @@ function makeShell(input: {
   readonly snoozedUntil?: string | null;
   readonly snoozedAt?: string | null;
   readonly sessionStatus?: "starting" | "running" | "ready" | "error";
+  readonly rateLimitResetsAt?: string | null;
   readonly pending?: "approval" | "user-input";
   readonly turnCompletedAt?: string | null;
 }): ThreadSnoozeShell {
@@ -38,15 +40,16 @@ function makeShell(input: {
     hasPendingApprovals: input.pending === "approval",
     hasPendingUserInput: input.pending === "user-input",
     session:
-      input.sessionStatus === undefined
+      input.sessionStatus === undefined && input.rateLimitResetsAt === undefined
         ? null
         : {
             threadId,
-            status: input.sessionStatus,
+            status: input.sessionStatus ?? "ready",
             providerName: "Codex",
             runtimeMode: "full-access",
             activeTurnId: null,
             lastError: input.sessionStatus === "error" ? "boom" : null,
+            rateLimitResetsAt: input.rateLimitResetsAt ?? null,
             updatedAt: "2026-04-10T11:00:00.000Z",
           },
     latestTurn:
@@ -369,5 +372,90 @@ describe("resolveSnoozePresets", () => {
     ]);
     const tomorrow = new Date(presets.find((preset) => preset.id === "tomorrow")!.snoozedUntil);
     expect(tomorrow.getDay()).toBe(1);
+  });
+});
+
+describe("usageLimitSnoozeOffer", () => {
+  const RESETS_AT = "2026-04-10T14:00:00.000Z";
+
+  function makeLimitShell(
+    input: Parameters<typeof makeShell>[0] & { readonly latestUserMessageAt?: string },
+  ) {
+    return { ...makeShell(input), latestUserMessageAt: input.latestUserMessageAt ?? null };
+  }
+
+  it("offers a snooze one minute past the reported reset", () => {
+    expect(
+      usageLimitSnoozeOffer(makeLimitShell({ rateLimitResetsAt: RESETS_AT }), { now: NOW }),
+    ).toEqual({
+      resetsAt: RESETS_AT,
+      snoozedUntil: "2026-04-10T14:01:00.000Z",
+      snoozable: true,
+    });
+  });
+
+  it("offers nothing when no limit was reported", () => {
+    expect(
+      usageLimitSnoozeOffer(makeLimitShell({ sessionStatus: "ready" }), { now: NOW }),
+    ).toBeNull();
+  });
+
+  it("offers nothing once the reset has passed", () => {
+    expect(
+      usageLimitSnoozeOffer(makeLimitShell({ rateLimitResetsAt: "2026-04-10T11:00:00.000Z" }), {
+        now: NOW,
+      }),
+    ).toBeNull();
+  });
+
+  it("offers nothing on malformed reset data", () => {
+    expect(
+      usageLimitSnoozeOffer(makeLimitShell({ rateLimitResetsAt: "not-a-date" }), { now: NOW }),
+    ).toBeNull();
+  });
+
+  it("stops offering once the user has already snoozed the thread", () => {
+    expect(
+      usageLimitSnoozeOffer(
+        makeLimitShell({ rateLimitResetsAt: RESETS_AT, snoozedUntil: FUTURE_WAKE }),
+        { now: NOW },
+      ),
+    ).toBeNull();
+  });
+
+  // Visibility and actionability are separate: the reset time is worth showing
+  // even in the states snooze refuses, which is exactly when a user is stuck.
+  it("still reports the limit while the agent is blocked on the user, with snooze off", () => {
+    const offer = usageLimitSnoozeOffer(
+      makeLimitShell({ rateLimitResetsAt: RESETS_AT, pending: "approval" }),
+      { now: NOW },
+    );
+    expect(offer?.resetsAt).toBe(RESETS_AT);
+    expect(offer?.snoozable).toBe(false);
+  });
+
+  // The canonical path: the user sends a message, the provider rejects it for
+  // the limit, and no turn adopts it — leaving a queued turn start.
+  it("still reports the limit during the queued-turn-start grace, with snooze off", () => {
+    const offer = usageLimitSnoozeOffer(
+      makeLimitShell({
+        rateLimitResetsAt: RESETS_AT,
+        latestUserMessageAt: "2026-04-10T11:59:30.000Z",
+      }),
+      { now: NOW },
+    );
+    expect(offer?.resetsAt).toBe(RESETS_AT);
+    expect(offer?.snoozable).toBe(false);
+  });
+
+  it("re-enables snooze once the queued-turn-start grace expires", () => {
+    const offer = usageLimitSnoozeOffer(
+      makeLimitShell({
+        rateLimitResetsAt: RESETS_AT,
+        latestUserMessageAt: "2026-04-10T11:50:00.000Z",
+      }),
+      { now: NOW },
+    );
+    expect(offer?.snoozable).toBe(true);
   });
 });

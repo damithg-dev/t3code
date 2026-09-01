@@ -101,6 +101,7 @@ import {
 } from "../Errors.ts";
 import { type ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
+import { rateLimitResetToIso } from "./rateLimitReset.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
@@ -3544,11 +3545,20 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
 
     if (message.type === "rate_limit_event") {
+      const info = message.rate_limit_info;
+      // Claude reports the full state each time, so "not rejected" is a
+      // trustworthy clear. A rejection whose reset is missing is not: it must
+      // not overwrite a reset we already know with "unknown".
+      const limitResetsAt =
+        info.status === "rejected"
+          ? rateLimitResetToIso(info.resetsAt ?? info.overageResetsAt)
+          : null;
       yield* offerRuntimeEvent({
         ...base,
         type: "account.rate-limits.updated",
         payload: {
           rateLimits: message,
+          ...(info.status === "rejected" && limitResetsAt === null ? {} : { limitResetsAt }),
         },
       });
       return;

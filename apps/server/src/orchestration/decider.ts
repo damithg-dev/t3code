@@ -16,6 +16,7 @@ import {
   type OrchestrationCommandRejection,
 } from "./Errors.ts";
 import {
+  findThreadById,
   listThreadsByProjectId,
   requireActiveProjectWorkspaceRootAbsent,
   requireProject,
@@ -1197,6 +1198,33 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         },
       };
       return [unsettledEvent, sessionSetEvent];
+    }
+
+    case "thread.session.rate-limit-set": {
+      // A limit report is provider bookkeeping, not thread activity: it must
+      // never wake a settled thread, never move session.updatedAt (which would
+      // raise a snoozed thread's hand and reorder sidebars), and never write an
+      // event when nothing changed. A thread with no session has nowhere to
+      // record it, which is normal for limits reported between sessions.
+      const thread = findThreadById(readModel, command.threadId);
+      const session = thread?.session;
+      if (!session || (session.rateLimitResetsAt ?? null) === command.resetsAt) {
+        return [];
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+          metadata: {},
+        })),
+        type: "thread.session-set",
+        payload: {
+          threadId: command.threadId,
+          session: { ...session, rateLimitResetsAt: command.resetsAt },
+        },
+      };
     }
 
     case "thread.message.assistant.delta": {

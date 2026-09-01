@@ -68,6 +68,13 @@ to reveal them, or focus **Show other notices** with `Tab` and press `Enter` or 
 `Escape` to close the stack and return focus to that control. On a touchscreen, tap the peek to
 open the stack. Interacting with the attached banner or composer does not open the stack.
 
+On web and desktop, when Claude or Codex reports that you have hit a usage limit, a notice shows
+when your limits reset and offers to snooze the thread until a minute after that. Snoozing only
+hides the thread from your active list until then — nothing resumes on its own, and you can wake
+the thread at any time. Snoozing is unavailable while the thread is waiting on you or has a
+message no turn has picked up yet, but the reset time still shows. Dismiss the notice to hide it
+until the next limit, or let it disappear on its own once the reset time passes.
+
 ## Prompt stash
 
 Use the default shortcut, `Cmd+S` on macOS or `Ctrl+S` on Windows and Linux, to stash the current

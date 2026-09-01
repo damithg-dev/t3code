@@ -705,7 +705,14 @@ const AccountUpdatedPayload = Schema.Struct({
 export type AccountUpdatedPayload = typeof AccountUpdatedPayload.Type;
 
 const AccountRateLimitsUpdatedPayload = Schema.Struct({
+  /** Raw provider snapshot; its shape varies per provider. */
   rateLimits: Schema.Unknown,
+  /**
+   * Adapter-normalized usage limit, tri-state: absent means the provider said
+   * nothing usable and known state must be left alone, null means it affirmed
+   * the account is not limited, and a timestamp means limited until then.
+   */
+  limitResetsAt: Schema.optional(Schema.NullOr(IsoDateTime)),
 });
 export type AccountRateLimitsUpdatedPayload = typeof AccountRateLimitsUpdatedPayload.Type;
 

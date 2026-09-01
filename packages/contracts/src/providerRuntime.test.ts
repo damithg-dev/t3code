@@ -181,6 +181,38 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.payload.usage.maxTokens).toBe(200000);
     expect(parsed.payload.usage.usedTokens).toBe(31251);
   });
+
+  function decodeRateLimitPayload(payload: unknown) {
+    const parsed = decodeRuntimeEvent({
+      type: "account.rate-limits.updated",
+      eventId: "event-rate-limits",
+      provider: "claudeAgent",
+      createdAt: "2026-02-28T00:00:05.000Z",
+      threadId: "thread-1",
+      payload,
+    });
+    if (parsed.type !== "account.rate-limits.updated") {
+      throw new Error("expected account.rate-limits.updated");
+    }
+    return parsed.payload;
+  }
+
+  it("decodes a reported usage limit alongside the raw snapshot", () => {
+    const payload = decodeRateLimitPayload({
+      rateLimits: { status: "rejected" },
+      limitResetsAt: "2026-02-28T05:00:00.000Z",
+    });
+
+    expect(payload.limitResetsAt).toBe("2026-02-28T05:00:00.000Z");
+    expect(payload.rateLimits).toEqual({ status: "rejected" });
+  });
+
+  it("distinguishes an affirmed clear from the provider saying nothing", () => {
+    expect(
+      decodeRateLimitPayload({ rateLimits: {}, limitResetsAt: null }).limitResetsAt,
+    ).toBeNull();
+    expect(decodeRateLimitPayload({ rateLimits: {} }).limitResetsAt).toBeUndefined();
+  });
 });
 
 describe("classifyTaskAgentKind", () => {
