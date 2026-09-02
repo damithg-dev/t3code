@@ -140,8 +140,30 @@ HTTP listener via `markHttpListening`; publish ready; fork the heartbeat; then e
 output or open the browser. Command readiness precedes the listener, so a socket that opens can
 already dispatch.
 
+## Desktop windows
+
+The desktop shell can hold several app windows at once. `DesktopWindow.createWindow` takes a role:
+the **main** window (window 1) owns the singular state — the persisted `mainWindowBounds` record,
+the module-level bounds flush, the `ElectronWindow` main registration, and the connecting splash —
+while a **secondary** window reuses the rest of the per-window setup and persists nothing. Only
+`createSecondary`, driven by File → New Window, makes one; `activate` and `ensureMain` are
+unchanged, so nothing creates a window implicitly.
+
+`PreviewManager` keeps a registry of windows keyed by each window's own `webContents.id`, which is
+what a preview guest's `hostWebContents` resolves to. Guest attachment accepts any registered
+window and shortcut forwarding targets the guest's own host. An event whose host is unknown or
+destroyed is dropped rather than routed to another window: misdelivering input into a different
+project is worse than losing the press. Windows unregister on `closed`, and preview teardown
+(recordings, picture-in-picture) runs only when the last one goes.
+
+Windows are a desktop-only surface. The web client's equivalent is a second browser window against
+the same server, and mobile shows one project at a time, so neither needed a change. Nothing
+crosses the wire: each renderer is an ordinary client of the same local backend, which was already
+multi-client.
+
 ## Related
 
+- [Multiple windows](../user/multiple-windows.md)
 - [Workspace layout](./workspace-layout.md), [Glossary](./glossary.md)
 - [Mobile navigation headers](./mobile-navigation.md)
 - [Remote environments](./remote.md), [Server updates](./server-updates.md)
