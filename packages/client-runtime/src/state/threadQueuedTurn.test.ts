@@ -9,6 +9,7 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  draftCanBeQueued,
   providerSupportsLimitQueue,
   queueForLimitResetOffer,
   queuedTurnStatus,
@@ -132,5 +133,19 @@ describe("queuedTurnStatus", () => {
     expect(queuedTurnStatus({ ...base, state: "queued" })).toBe("waiting");
     expect(queuedTurnStatus({ ...base, state: "awaiting" })).toBe("sending");
     expect(queuedTurnStatus({ ...base, state: "stalled", attempts: 2 })).toBe("stalled");
+  });
+});
+
+describe("draftCanBeQueued", () => {
+  it("accepts a text-only draft", () => {
+    expect(draftCanBeQueued({ attachmentCount: 0, contextCount: 0 })).toBe(true);
+  });
+
+  // Attachments need the upload path a live turn has; contexts are snapshots
+  // that will be stale by the time limits reset. Both keep the ordinary send.
+  it("refuses a draft carrying attachments or contexts", () => {
+    expect(draftCanBeQueued({ attachmentCount: 1, contextCount: 0 })).toBe(false);
+    expect(draftCanBeQueued({ attachmentCount: 0, contextCount: 1 })).toBe(false);
+    expect(draftCanBeQueued({ attachmentCount: 2, contextCount: 3 })).toBe(false);
   });
 });
