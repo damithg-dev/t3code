@@ -102,6 +102,7 @@ export function applyThreadDetailEvent(
           activities: [],
           checkpoints: [],
           session: null,
+          queuedTurn: null,
         },
       };
 
@@ -268,6 +269,22 @@ export function applyThreadDetailEvent(
           interactionMode: event.payload.interactionMode,
           updatedAt: event.occurredAt,
         },
+      };
+
+    case "thread.turn-queued":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          queuedTurn: event.payload.queuedTurn,
+          updatedAt: event.payload.updatedAt,
+        },
+      };
+
+    case "thread.turn-dequeued":
+      return {
+        kind: "updated",
+        thread: { ...thread, queuedTurn: null, updatedAt: event.payload.updatedAt },
       };
 
     case "thread.turn-interrupt-requested": {
