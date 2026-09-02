@@ -49,6 +49,15 @@ const dispatchMenuAction = Effect.fn("desktop.menu.dispatchMenuAction")(function
   yield* desktopWindow.dispatchMenuAction(action);
 });
 
+const openNewWindow = Effect.fn("desktop.menu.openNewWindow")(function* (): Effect.fn.Return<
+  void,
+  DesktopWindow.DesktopWindowError,
+  DesktopWindow.DesktopWindow
+> {
+  const desktopWindow = yield* DesktopWindow.DesktopWindow;
+  yield* desktopWindow.createSecondary;
+});
+
 const zoomMainWindow = Effect.fn("desktop.menu.zoomMainWindow")(function* (
   direction: DesktopWindow.MainWindowZoomDirection,
 ): Effect.fn.Return<void, never, DesktopWindow.DesktopWindow> {
@@ -134,6 +143,9 @@ export const make = Effect.gen(function* () {
     const settingsClick = () => {
       runMenuEffect("open-settings", dispatchMenuAction("open-settings"));
     };
+    const newWindowClick = () => {
+      runMenuEffect("new-window", openNewWindow());
+    };
     const zoomClick = (direction: DesktopWindow.MainWindowZoomDirection) => () => {
       runMenuEffect(`zoom-${direction}`, zoomMainWindow(direction));
     };
@@ -170,6 +182,12 @@ export const make = Effect.gen(function* () {
       {
         label: "File",
         submenu: [
+          {
+            label: "New Window",
+            accelerator: "CmdOrCtrl+Shift+N",
+            click: newWindowClick,
+          },
+          { type: "separator" },
           ...(environment.platform === "darwin"
             ? []
             : [
