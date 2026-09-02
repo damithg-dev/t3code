@@ -104,6 +104,7 @@ import { resolveMarkdownMediaPreview } from "../../lib/markdownMedia";
 import { useMediaActions, type MediaActionsSource } from "../../lib/mediaActions";
 import { MediaActionsMenu } from "../../components/MediaActionsMenu";
 import {
+  attachmentVideoPreviewSource,
   mediaVideoPreviewUri,
   mediaVideoThumbnailKey,
   type MediaVideoPreviewSource,
@@ -134,11 +135,13 @@ import {
 } from "../../lib/appearancePreferences";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import { useAppearanceCodeSurface } from "../settings/appearance/useAppearanceCodeSurface";
+import { mediaFileReference } from "@t3tools/client-runtime/media-reference";
 import { markdownFileIconSource } from "@t3tools/mobile-markdown-text/file-icons";
 import {
   normalizeNativeMarkdownUrl,
   resolveMarkdownInlineCodePresentation,
   resolveMarkdownLinkPresentation,
+  type MarkdownLinkPresentation,
 } from "@t3tools/mobile-markdown-text/links";
 import {
   deriveThreadFeedPresentation,
@@ -173,6 +176,7 @@ import {
   basename,
   fileRoutePathSegments,
   isAbsolutePath,
+  resolveWorkspaceFilePath,
   resolveWorkspaceRelativeFilePath,
 } from "../files/filePath";
 import { MARKDOWN_IMAGE_MAX_WIDTH, resolveMarkdownImageDisplaySize } from "./markdownImageSize";
@@ -245,14 +249,21 @@ function MessageAttachmentImage(props: {
   readonly environmentId: EnvironmentId;
   readonly attachmentId: string;
   readonly name: string;
+  readonly mimeType: string;
   readonly className: string;
   readonly onPressPreview: (source: FilePreviewSource) => void;
 }) {
   const sourceIdentifier = useId();
-  const uri = useAssetUrl(props.environmentId, {
-    _tag: "attachment",
-    attachmentId: props.attachmentId,
-  });
+  const resource = useMemo(
+    () => ({
+      _tag: "attachment" as const,
+      attachmentId: props.attachmentId,
+      fileName: props.name,
+      mimeType: props.mimeType,
+    }),
+    [props.attachmentId, props.name, props.mimeType],
+  );
+  const uri = useAssetUrl(props.environmentId, resource);
 
   if (uri === null) {
     return (
@@ -268,7 +279,20 @@ function MessageAttachmentImage(props: {
         accessibilityRole="imagebutton"
         accessibilityLabel={`Open ${props.name}`}
         onPress={() =>
-          props.onPressPreview({ kind: "image", uri, name: props.name, sourceIdentifier })
+          // The viewer mints its own URL from the resource so the image survives a refresh.
+          props.onPressPreview({
+            kind: "image",
+            environmentId: props.environmentId,
+            resource,
+            name: props.name,
+            sourceIdentifier,
+            actionsSource: {
+              name: props.name,
+              mimeType: props.mimeType,
+              environmentId: props.environmentId,
+              resource,
+            },
+          })
         }
       >
         <Image source={{ uri }} className={props.className} resizeMode="cover" />
@@ -388,9 +412,9 @@ function MessageAttachmentFile(props: {
         name={attachment.name}
         sourceIdentifier={`attachment:${props.environmentId}:${attachment.id}`}
         thumbnailSource={thumbnailUrl}
+        actionsSource={attachmentVideoPreviewSource(props.environmentId, attachment).actionsSource}
         disabled={opening || httpBaseUrl === null}
         onPress={(sourceIdentifier) => props.onPressVideo(attachment, sourceIdentifier)}
-        onShare={() => shareFile(`attachment:${props.environmentId}:${attachment.id}`)}
         className="my-1 rounded-2xl"
         style={{ width: 224, maxWidth: "100%", aspectRatio: 16 / 9 }}
       />
@@ -777,6 +801,63 @@ const MarkdownExternalLink = memo(function MarkdownExternalLink(props: {
   );
 });
 
+/** Lets file chips build copy/open/share actions without threading ids through every renderer. */
+const MarkdownFileChipContext = createContext<{
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly workspaceRoot: string | null | undefined;
+} | null>(null);
+
+/**
+ * A file reference as a tappable chip. Long-press opens the same actions the
+ * web context menu offers: copy paths, open in the file viewer, save or share.
+ */
+function MarkdownFileChip(props: {
+  readonly presentation: Extract<MarkdownLinkPresentation, { readonly kind: "file" }>;
+  readonly color: string;
+  readonly fontSize?: number;
+  readonly lineHeight?: number;
+  readonly onPress: () => void;
+}) {
+  const { presentation } = props;
+  const feed = useContext(MarkdownFileChipContext);
+  const actionsSource = useMemo<MediaActionsSource | undefined>(() => {
+    if (!feed) return undefined;
+    const media = resolveMarkdownMediaPreview(presentation.href, feed);
+    if (media) return media.source.actionsSource;
+    const path = isAbsolutePath(presentation.path)
+      ? presentation.path
+      : resolveWorkspaceFilePath(feed.workspaceRoot ?? "", presentation.path);
+    return {
+      name: basename(presentation.path),
+      mimeType: "application/octet-stream",
+      reference: mediaFileReference(path, feed.workspaceRoot),
+      environmentId: feed.environmentId,
+      threadId: feed.threadId,
+      resource: { _tag: "media-file", threadId: feed.threadId, path },
+    };
+  }, [feed, presentation]);
+  const mediaActions = useMediaActions(actionsSource);
+  const chip = (
+    <NativeText
+      className="font-t3-bold"
+      onPress={props.onPress}
+      style={{
+        color: props.color,
+        ...(props.fontSize !== undefined ? { fontSize: props.fontSize } : {}),
+        ...(props.lineHeight !== undefined ? { lineHeight: props.lineHeight } : {}),
+      }}
+    >
+      <Image
+        source={markdownFileIconSource(presentation.icon)}
+        style={markdownLinkStyles.inlineIcon}
+      />
+      {presentation.label}
+    </NativeText>
+  );
+  return <MediaActionsMenu media={mediaActions}>{chip}</MediaActionsMenu>;
+}
+
 function MarkdownInlineCode(props: {
   readonly content: string;
   readonly textColor: string;
@@ -787,23 +868,23 @@ function MarkdownInlineCode(props: {
 }) {
   const insideLink = useContext(MarkdownLinkLabelContext);
   const presentation = insideLink ? null : resolveMarkdownInlineCodePresentation(props.content);
+  if (presentation) {
+    return (
+      <MarkdownFileChip
+        presentation={presentation}
+        color={props.textColor}
+        fontSize={props.fontSize}
+        lineHeight={props.lineHeight}
+        onPress={() => props.onLinkPress(presentation.href)}
+      />
+    );
+  }
   return (
     <NativeText
-      className={presentation ? "font-t3-bold" : "font-mono"}
-      onPress={presentation ? () => props.onLinkPress(presentation.href) : undefined}
-      style={{
-        color: presentation ? props.textColor : props.codeColor,
-        fontSize: props.fontSize,
-        lineHeight: props.lineHeight,
-      }}
+      className="font-mono"
+      style={{ color: props.codeColor, fontSize: props.fontSize, lineHeight: props.lineHeight }}
     >
-      {presentation ? (
-        <Image
-          source={markdownFileIconSource(presentation.icon)}
-          style={markdownLinkStyles.inlineIcon}
-        />
-      ) : null}
-      {presentation?.label ?? props.content}
+      {props.content}
     </NativeText>
   );
 }
@@ -1185,17 +1266,11 @@ function useMarkdownStyles(
         const presentation = resolveMarkdownLinkPresentation(href);
         if (presentation.kind === "file") {
           return (
-            <NativeText
-              className="font-t3-bold"
+            <MarkdownFileChip
+              presentation={presentation}
+              color={inlineTextColor}
               onPress={() => onLinkPress(href)}
-              style={{ color: inlineTextColor }}
-            >
-              <Image
-                source={markdownFileIconSource(presentation.icon)}
-                style={markdownLinkStyles.inlineIcon}
-              />
-              {presentation.label}
-            </NativeText>
+            />
           );
         }
         if (presentation.kind === "external") {
@@ -1580,6 +1655,7 @@ function renderFeedEntry(
                   environmentId={props.environmentId}
                   attachmentId={attachment.id}
                   name={attachment.name}
+                  mimeType={attachment.mimeType}
                   className="aspect-[1.3] w-full rounded-[14px] bg-white/15"
                   onPressPreview={props.onPressPreview}
                 />
@@ -1643,6 +1719,7 @@ function renderFeedEntry(
               environmentId={props.environmentId}
               attachmentId={attachment.id}
               name={attachment.name}
+              mimeType={attachment.mimeType}
               className="mt-1.5 aspect-[1.3] w-full rounded-[18px] bg-adaptive-neutral-200-800"
               onPressPreview={props.onPressPreview}
             />
@@ -2250,6 +2327,14 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
     [props.environmentId, props.threadId, props.workspaceRoot],
   );
   const markdownStyles = useMarkdownStyles(onMarkdownLinkPress, renderMarkdownImage);
+  const markdownFileChipContext = useMemo(
+    () => ({
+      environmentId: props.environmentId,
+      threadId: props.threadId,
+      workspaceRoot: props.workspaceRoot,
+    }),
+    [props.environmentId, props.threadId, props.workspaceRoot],
+  );
   const reviewCommentColors = useReviewCommentColors();
   // LegendList does not invalidate visible rows when only the renderItem closure changes.
   // Keep row-local interaction props in extraData so disclosures and copy feedback repaint.
@@ -2629,12 +2714,8 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
     (attachment: ChatFileAttachment, sourceIdentifier: string) => {
       setExpandedVideo(
         (current) =>
-          current ?? {
-            type: "remote",
-            environmentId: props.environmentId,
-            attachment,
-            sourceIdentifier,
-          },
+          current ??
+          attachmentVideoPreviewSource(props.environmentId, attachment, sourceIdentifier),
       );
     },
     [props.environmentId],
@@ -2678,32 +2759,34 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         entering={disclosureToggleSettling ? THREAD_FEED_DISCLOSURE_ENTER_TRANSITION : undefined}
       >
         <ThreadMediaVisibility>
-          {renderFeedEntry(info, {
-            environmentId: props.environmentId,
-            copiedRowId,
-            expandedWorkRows,
-            workRowSizing,
-            workGroupScrollPositions,
-            terminalAssistantMessageIds,
-            unsettledTurnId,
-            onCopyWorkRow,
-            onToggleWorkGroup,
-            onToggleWorkRow,
-            onToggleTurnFold,
-            onPressPreview,
-            onPressVideo,
-            onMarkdownLinkPress,
-            renderMarkdownImage,
-            renderViewedImage,
-            iconSubtleColor,
-            userBubbleColor,
-            markdownStyles,
-            reviewCommentColors,
-            reviewCommentBubbleWidth,
-            userBubbleMaxWidth,
-            skills: props.skills,
-            onUseArtifactTemplate: props.onUseArtifactTemplate,
-          })}
+          <MarkdownFileChipContext value={markdownFileChipContext}>
+            {renderFeedEntry(info, {
+              environmentId: props.environmentId,
+              copiedRowId,
+              expandedWorkRows,
+              workRowSizing,
+              workGroupScrollPositions,
+              terminalAssistantMessageIds,
+              unsettledTurnId,
+              onCopyWorkRow,
+              onToggleWorkGroup,
+              onToggleWorkRow,
+              onToggleTurnFold,
+              onPressPreview,
+              onPressVideo,
+              onMarkdownLinkPress,
+              renderMarkdownImage,
+              renderViewedImage,
+              iconSubtleColor,
+              userBubbleColor,
+              markdownStyles,
+              reviewCommentColors,
+              reviewCommentBubbleWidth,
+              userBubbleMaxWidth,
+              skills: props.skills,
+              onUseArtifactTemplate: props.onUseArtifactTemplate,
+            })}
+          </MarkdownFileChipContext>
         </ThreadMediaVisibility>
       </Animated.View>
     ),
@@ -2717,6 +2800,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       unsettledTurnId,
       iconSubtleColor,
       userBubbleColor,
+      markdownFileChipContext,
       markdownStyles,
       reviewCommentColors,
       reviewCommentBubbleWidth,

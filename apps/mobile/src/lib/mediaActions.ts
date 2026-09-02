@@ -8,7 +8,9 @@ import { Alert } from "react-native";
 
 import { useRefreshAssetUrl } from "../state/assets";
 import { downloadAndShareAttachment, shareLocalAttachment } from "./attachmentDownload";
+import type { DraftComposerFileAttachment } from "./composerImages";
 import { copyTextWithHaptic } from "./copyTextWithHaptic";
+import { loadLocalAttachmentPreview } from "./localAttachmentPreview";
 
 /** Authored source metadata is kept separate from temporary preview/download URLs. */
 export type MediaActionsSource = {
@@ -17,9 +19,12 @@ export type MediaActionsSource = {
   readonly mimeType: string;
 } & (
   | { readonly uri: string }
+  /** A composer draft; sharing leases its file so the copy never outlives the draft. */
+  | { readonly attachment: DraftComposerFileAttachment }
   | {
       readonly environmentId: EnvironmentId;
-      readonly threadId: ThreadId;
+      /** Names the file viewer route for workspace files. Attachments have no such route. */
+      readonly threadId?: ThreadId;
       readonly resource: AssetResource;
     }
 );
@@ -40,6 +45,16 @@ export function useMediaActions(source: MediaActionsSource | undefined, onOpenFi
     controller.current = request;
     setSharing(true);
     void (async () => {
+      if ("attachment" in source) {
+        const preview = await loadLocalAttachmentPreview(source.attachment, request.signal);
+        if (!preview) return;
+        try {
+          await preview.share(request.signal);
+        } finally {
+          preview.dispose();
+        }
+        return;
+      }
       const uri = "uri" in source ? normalizeNativeMarkdownUrl(source.uri) : await refresh();
       if (request.signal.aborted) return;
       if (uri === null) throw new Error("The file could not be loaded. Reconnect and try again.");
@@ -68,13 +83,14 @@ export function useMediaActions(source: MediaActionsSource | undefined, onOpenFi
 
   const reference = source?.reference;
   const relativePath = reference?.kind === "file" ? reference.relativePath : undefined;
+  const threadId = source && "threadId" in source ? source.threadId : undefined;
   const openFile =
-    source && relativePath && "environmentId" in source
+    source && relativePath && "environmentId" in source && threadId !== undefined
       ? () => {
           onOpenFile?.();
           navigation.navigate("ThreadFile", {
             environmentId: String(source.environmentId),
-            threadId: String(source.threadId),
+            threadId: String(threadId),
             path: relativePath.split("/"),
           });
         }

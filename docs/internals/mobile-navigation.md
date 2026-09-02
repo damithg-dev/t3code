@@ -86,10 +86,13 @@ composer thumbnails, and workspace image previews. The workspace PDF web preview
 Open PDF action for the native viewer. Android retains its image viewer and uses the
 system chooser for PDFs. Saving images on iOS uses the add-only photo-library permission.
 
-Received videos open directly from their signed asset URL. AVKit handles buffering;
-the client does not download the entire file or show a separate opening overlay before
-presentation. The URL is captured once per preview so credential refresh does not
-restart playback. Saving or sharing still downloads the original file.
+Every video on iOS opens in AVKit directly from its signed asset URL: sent attachments,
+markdown and workspace videos, and composer drafts. AVKit handles buffering; the client
+does not download the entire file or show a separate opening overlay before presentation.
+The URL is captured once per preview so credential refresh does not restart playback.
+Media actions (copy path, open in file viewer, save or share) belong to the surface that
+opened the video, a long-press on the file chip or thumbnail, so the player carries no
+menu. AVKit has no retry; a failed mint alerts and closes, and the next open mints again.
 
 The native presentation promise completes after dismissal. Local draft previews
 hold their file lease until that promise settles. The iOS preview component requests
@@ -97,8 +100,9 @@ native dismissal when its source screen unmounts. Playback pauses in the backgro
 AVPlayer activates audio as playback starts. The presenter pauses and releases
 its own player on close, then restores the previous audio-session configuration
 if no other component changed it during playback. It does not deactivate the
-shared session, which may still serve another player or recorder. Android retains
-its React Native modal and Expo Video player.
+shared session, which may still serve another player or recorder. Android plays every
+video, attachments included, in its React Native modal with the Expo Video player,
+streaming from the signed URL and downloading only for save or share.
 
 `shareFileFromSource` uses the same source registration to anchor UIKit's activity
 controller. Its promise completes when the native share flow finishes, keeping
