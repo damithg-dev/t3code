@@ -372,6 +372,45 @@ it.layer(NodeServices.layer)("queued turn decider", (it) => {
     }),
   );
 
+  // Archiving hides the thread from every active read, including the
+  // sweeper's, so a queued turn left behind would reappear on unarchive as a
+  // stale send nobody asked for.
+  it.effect("drops a queued turn when the thread is archived", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(NOW));
+      const events = yield* decide({
+        command: {
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-archive"),
+          threadId: THREAD_ID,
+        },
+        readModel: makeReadModel({ queuedTurn: makeQueuedTurn() }),
+      });
+      expect(events.map((event) => event.type)).toEqual([
+        "thread.archived",
+        "thread.turn-dequeued",
+      ]);
+      const dequeued = events[1];
+      if (dequeued?.type !== "thread.turn-dequeued") return;
+      expect(dequeued.payload.reason).toBe("orphaned");
+    }),
+  );
+
+  it.effect("archives a thread with nothing queued unchanged", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(NOW));
+      const events = yield* decide({
+        command: {
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-archive"),
+          threadId: THREAD_ID,
+        },
+        readModel: makeReadModel({ queuedTurn: null }),
+      });
+      expect(events.map((event) => event.type)).toEqual(["thread.archived"]);
+    }),
+  );
+
   it.effect("rejects queueing onto an archived thread", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(Date.parse(NOW));
