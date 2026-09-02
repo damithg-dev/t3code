@@ -1110,3 +1110,128 @@ it("isProviderSendTurnSupportedImageMimeType accepts raster formats and rejects 
   assert.strictEqual(isProviderSendTurnSupportedImageMimeType("IMAGE/JPEG"), true);
   assert.strictEqual(isProviderSendTurnSupportedImageMimeType("image/svg+xml"), false);
 });
+
+it.effect("round-trips the queue and cancel commands a stalled composer sends", () =>
+  Effect.gen(function* () {
+    const queued = yield* decodeClientOrchestrationCommand({
+      type: "thread.turn.queue",
+      commandId: "cmd-queue-1",
+      threadId: "thread-1",
+      message: { messageId: "message-1", text: "keep going" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      dispatchAfter: "2026-01-01T05:01:00.000Z",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(queued.type, "thread.turn.queue");
+    if (queued.type !== "thread.turn.queue") return;
+    assert.strictEqual(queued.message.text, "keep going");
+    assert.strictEqual(queued.dispatchAfter, "2026-01-01T05:01:00.000Z");
+
+    const cancelled = yield* decodeClientOrchestrationCommand({
+      type: "thread.turn.dequeue",
+      commandId: "cmd-dequeue-1",
+      threadId: "thread-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(cancelled.type, "thread.turn.dequeue");
+
+    // An empty draft is not a queueable turn.
+    const blank = yield* Effect.exit(
+      decodeClientOrchestrationCommand({
+        type: "thread.turn.queue",
+        commandId: "cmd-queue-blank",
+        threadId: "thread-1",
+        message: { messageId: "message-1", text: "   " },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        dispatchAfter: "2026-01-01T05:01:00.000Z",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    assert.strictEqual(blank._tag, "Failure");
+  }),
+);
+
+it.effect("round-trips the queued and dequeued thread events", () =>
+  Effect.gen(function* () {
+    const queued = yield* decodeOrchestrationEvent({
+      sequence: 1,
+      eventId: "event-queue-1",
+      aggregateKind: "thread",
+      aggregateId: "thread-1",
+      type: "thread.turn-queued",
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      commandId: "cmd-queue-1",
+      causationEventId: null,
+      correlationId: "cmd-queue-1",
+      metadata: {},
+      payload: {
+        threadId: "thread-1",
+        queuedTurn: {
+          messageId: "message-1",
+          text: "keep going",
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          state: "queued",
+          readyAt: "2026-01-01T05:01:00.000Z",
+          attempts: 0,
+          queuedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+    assert.strictEqual(queued.type, "thread.turn-queued");
+    if (queued.type !== "thread.turn-queued") return;
+    assert.strictEqual(queued.payload.queuedTurn.state, "queued");
+    assert.strictEqual(queued.payload.queuedTurn.attempts, 0);
+
+    const dequeued = yield* decodeOrchestrationEvent({
+      sequence: 2,
+      eventId: "event-dequeue-1",
+      aggregateKind: "thread",
+      aggregateId: "thread-1",
+      type: "thread.turn-dequeued",
+      occurredAt: "2026-01-01T00:01:00.000Z",
+      commandId: "cmd-dequeue-1",
+      causationEventId: null,
+      correlationId: "cmd-dequeue-1",
+      metadata: {},
+      payload: {
+        threadId: "thread-1",
+        reason: "cancelled",
+        updatedAt: "2026-01-01T00:01:00.000Z",
+      },
+    });
+    assert.strictEqual(dequeued.type, "thread.turn-dequeued");
+    if (dequeued.type !== "thread.turn-dequeued") return;
+    assert.strictEqual(dequeued.payload.reason, "cancelled");
+  }),
+);
+
+// Pre-queue servers send shells without the field at all; that decodes to
+// "nothing queued", never to a half-built record.
+it.effect("decodes a thread shell from a server that knows nothing about queues", () =>
+  Effect.gen(function* () {
+    const shell = yield* decodeOrchestrationThreadShell({
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Thread",
+      modelSelection: { instanceId: "claudeAgent", model: "claude-opus" },
+      runtimeMode: "full-access",
+      branch: null,
+      worktreePath: null,
+      worktrees: [],
+      latestTurn: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      session: null,
+      latestUserMessageAt: null,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: false,
+    });
+    assert.strictEqual(shell.queuedTurn, undefined);
+  }),
+);
