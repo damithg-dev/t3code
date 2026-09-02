@@ -43,6 +43,7 @@ import {
   expandCollapsedComposerCursor,
   replaceTextRange,
 } from "../../composer-logic";
+import { draftCanBeQueued } from "@t3tools/client-runtime/state/thread-queued-turn";
 import { DISCONNECTED_COMPOSER_PLACEHOLDER } from "../../composerPlaceholder";
 import { deriveComposerSendState, readFileAsDataUrl } from "../ChatView.logic";
 import {
@@ -517,6 +518,8 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   isConnecting: boolean;
   isEnvironmentUnavailable: boolean;
   hasSendableContent: boolean;
+  /** See ComposerPrimaryActions.queueForLabel. */
+  queueForLabel: string | null;
   preserveComposerFocusOnPointerDown?: boolean;
   showSendWhileRunning?: boolean;
   onPreviousPendingQuestion: () => void;
@@ -549,6 +552,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         isEnvironmentUnavailable={props.isEnvironmentUnavailable}
         isPreparingWorktree={props.isPreparingWorktree}
         hasSendableContent={props.hasSendableContent}
+        queueForLabel={props.queueForLabel}
         preserveComposerFocusOnPointerDown={props.preserveComposerFocusOnPointerDown ?? false}
         showSendWhileRunning={props.showSendWhileRunning ?? false}
         onPreviousPendingQuestion={props.onPreviousPendingQuestion}
@@ -635,6 +639,8 @@ export interface ChatComposerProps {
   isConnecting: boolean;
   isSendBusy: boolean;
   sendDisabledReason: string | null;
+  /** See ComposerPrimaryActions.queueForLabel. */
+  queueForLabel: string | null;
   isPreparingWorktree: boolean;
   bannerItems: readonly ComposerBannerStackItem[];
   environmentUnavailable: {
@@ -757,6 +763,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     isConnecting,
     isSendBusy,
     sendDisabledReason: externalSendDisabledReason,
+    queueForLabel,
     isPreparingWorktree,
     environmentUnavailable,
     activePendingApproval,
@@ -1284,6 +1291,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       prompt,
     ],
   );
+
+  // The queue affordance only stands in for send on a text-only draft, and
+  // the same rule gates the handler in ChatView.
+  const resolvedQueueForLabel =
+    queueForLabel !== null &&
+    draftCanBeQueued({
+      attachmentCount: composerImages.length + composerFiles.length,
+      contextCount:
+        composerTerminalContexts.length +
+        composerElementContexts.length +
+        composerPreviewAnnotations.length +
+        composerReviewComments.length,
+    })
+      ? queueForLabel
+      : null;
 
   // ------------------------------------------------------------------
   // Derived: composer trigger / menu
@@ -4254,6 +4276,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     }
                     isPreparingWorktree={isPreparingWorktree}
                     hasSendableContent={composerSendState.hasSendableContent}
+                    queueForLabel={resolvedQueueForLabel}
                     preserveComposerFocusOnPointerDown={isMobileViewport}
                     showSendWhileRunning={isMobileViewport}
                     onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}

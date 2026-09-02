@@ -36,6 +36,11 @@ import {
   usageLimitSnoozeOffer,
 } from "@t3tools/client-runtime/state/thread-settled";
 import {
+  draftCanBeQueued,
+  queueForLimitResetOffer,
+  queuedTurnStatus,
+} from "@t3tools/client-runtime/state/thread-queued-turn";
+import {
   codexFeedbackMessage,
   parseCodexFeedbackCommand,
   submitCodexFeedback,
@@ -1337,6 +1342,8 @@ function ChatViewContent(props: ChatViewProps) {
     reportFailure: false,
   });
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const queueThreadTurn = useAtomCommand(threadEnvironment.queueTurn, { reportFailure: false });
+  const dequeueThreadTurn = useAtomCommand(threadEnvironment.dequeueTurn, { reportFailure: false });
   const createAttachmentAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
     reportFailure: false,
   });
@@ -4929,6 +4936,16 @@ function ChatViewContent(props: ChatViewProps) {
         : usageLimitSnoozeOffer(activeThreadShell, { now: nowMinuteIso }),
     [activeThreadShell, nowMinuteIso, supportsSnooze],
   );
+  // Same quantized clock as the usage-limit notice, so the button label and
+  // the notice can never disagree about when limits reset.
+  const queueOffer = useMemo(
+    () =>
+      activeThreadShell === null
+        ? null
+        : queueForLimitResetOffer(activeThreadShell, { now: nowMinuteIso }),
+    [activeThreadShell, nowMinuteIso],
+  );
+  const activeQueuedTurn = activeThreadShell?.queuedTurn ?? null;
   const [snoozingUsageLimitKey, setSnoozingUsageLimitKey] = useState<string | null>(null);
   const isSnoozingUsageLimit =
     snoozingUsageLimitKey !== null && snoozingUsageLimitKey === activeThreadKey;
@@ -5273,6 +5290,89 @@ function ChatViewContent(props: ChatViewProps) {
     usageLimitKey,
     usageLimitOffer,
   ]);
+  const [cancellingQueuedTurnKey, setCancellingQueuedTurnKey] = useState<string | null>(null);
+  const isCancellingQueuedTurn =
+    cancellingQueuedTurnKey !== null && cancellingQueuedTurnKey === activeThreadKey;
+  // The way out of a queue: the text goes back to the composer draft it came
+  // from, so cancelling costs nothing but a click.
+  const handleCancelQueuedTurn = useCallback(async () => {
+    if (activeThreadRef === null || activeQueuedTurn === null) return;
+    const threadRef = activeThreadRef;
+    const threadKey = scopedThreadKey(threadRef);
+    const draftTarget = composerDraftTarget;
+    const queuedText = activeQueuedTurn.text;
+    setCancellingQueuedTurnKey(threadKey);
+    try {
+      const result = await dequeueThreadTurn({
+        environmentId: threadRef.environmentId,
+        input: { threadId: threadRef.threadId },
+      });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Could not cancel the queued message",
+              description: chatActionErrorMessage(squashAtomCommandFailure(result)),
+            }),
+          );
+        }
+        return;
+      }
+      // Only restore into an empty draft: the user may have typed something
+      // new while the message sat in the queue, and that is the newer intent.
+      if (promptRef.current.trim().length === 0) {
+        setComposerDraftPrompt(draftTarget, queuedText);
+        promptRef.current = queuedText;
+      }
+    } finally {
+      setCancellingQueuedTurnKey((current) => (current === threadKey ? null : current));
+    }
+  }, [
+    activeQueuedTurn,
+    activeThreadRef,
+    composerDraftTarget,
+    dequeueThreadTurn,
+    promptRef,
+    setComposerDraftPrompt,
+  ]);
+  // The queue is only real if it is visible and reversible. One notice per
+  // queued turn, always carrying its cancel — including once it has stalled,
+  // which is the state that most needs a way out.
+  const queuedTurnBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
+    if (activeQueuedTurn === null || !activeThread) return null;
+    const status = queuedTurnStatus(activeQueuedTurn);
+    const description =
+      status === "stalled"
+        ? "The limit came back when we tried to send it. Cancel to get your message back, or queue it again."
+        : status === "sending"
+          ? "Sending it now."
+          : `Sending it ${snoozeWakeDescription(activeQueuedTurn.readyAt, nowMinuteDate, timestampFormat)}.`;
+    return {
+      id: `queued-turn:${activeThread.id}:${activeQueuedTurn.messageId}`,
+      variant: status === "stalled" ? "warning" : "info",
+      icon: <AlarmClockIcon />,
+      title: status === "stalled" ? "Queued message still blocked" : "Message queued",
+      description,
+      actions: (
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={isCancellingQueuedTurn}
+          onClick={() => void handleCancelQueuedTurn()}
+        >
+          {isCancellingQueuedTurn ? "Cancelling..." : "Cancel"}
+        </Button>
+      ),
+    };
+  }, [
+    activeQueuedTurn,
+    activeThread,
+    handleCancelQueuedTurn,
+    isCancellingQueuedTurn,
+    nowMinuteDate,
+    timestampFormat,
+  ]);
   // Session-scoped dismissals, one key per (thread, snapshot). A set rather
   // than a single slot so dismissing the banner on one thread does not
   // resurface it on another thread dismissed earlier.
@@ -5389,10 +5489,12 @@ function ChatViewContent(props: ChatViewProps) {
     const wokeThreadItems = wokeThreadBannerItem === null ? [] : [wokeThreadBannerItem];
     const parkedThreadItems = parkedThreadBannerItem === null ? [] : [parkedThreadBannerItem];
     const usageLimitItems = usageLimitBannerItem === null ? [] : [usageLimitBannerItem];
+    const queuedTurnItems = queuedTurnBannerItem === null ? [] : [queuedTurnBannerItem];
     if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
       return [
         ...systemComposerBannerItems,
         ...backgroundLivenessItems,
+        ...queuedTurnItems,
         ...usageLimitItems,
         ...resumeCompactionItems,
         ...wokeThreadItems,
@@ -5402,6 +5504,7 @@ function ChatViewContent(props: ChatViewProps) {
     return [
       ...systemComposerBannerItems,
       ...backgroundLivenessItems,
+      ...queuedTurnItems,
       ...usageLimitItems,
       ...resumeCompactionItems,
       ...wokeThreadItems,
@@ -5454,6 +5557,7 @@ function ChatViewContent(props: ChatViewProps) {
     localCheckoutBranchMismatch,
     parkedThreadBannerItem,
     resumeCompactionBannerItem,
+    queuedTurnBannerItem,
     showBranchMismatchBanner,
     systemComposerBannerItems,
     usageLimitBannerItem,
@@ -6150,6 +6254,65 @@ function ChatViewContent(props: ChatViewProps) {
       text: messageTextForSend || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
     });
     if (composerRef.current?.validateProviderInput(outgoingMessageText) === false) {
+      return;
+    }
+
+    // Park the turn instead of sending it while the provider is still rate
+    // limited. Only reachable from a composer that showed "Queue for HH:MM":
+    // the same offer and the same text-only rule gate the button, so this can
+    // never turn an intended send into a silent queue.
+    if (
+      queueOffer !== null &&
+      isServerThread &&
+      trimmed.length > 0 &&
+      draftCanBeQueued({
+        attachmentCount: composerAttachmentsSnapshot.length,
+        contextCount:
+          composerTerminalContextsSnapshot.length +
+          composerElementContextsSnapshot.length +
+          composerPreviewAnnotationsSnapshot.length +
+          composerReviewCommentsSnapshot.length,
+      })
+    ) {
+      sendInFlightRef.current = true;
+      const queuedPrompt = promptRef.current;
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
+      const queueResult = await queueThreadTurn({
+        environmentId,
+        input: {
+          threadId: threadIdForSend,
+          message: { messageId: newMessageId(), text: outgoingMessageText },
+          ...(ctxSelectedModel ? { modelSelection: ctxSelectedModelSelection } : {}),
+          runtimeMode,
+          interactionMode,
+          dispatchAfter: queueOffer.dispatchAfter,
+        },
+      });
+      sendInFlightRef.current = false;
+      if (queueResult._tag === "Failure") {
+        // The way in failed, so give the draft back rather than losing it.
+        setComposerDraftPrompt(composerDraftTarget, queuedPrompt);
+        promptRef.current = queuedPrompt;
+        if (!isAtomCommandInterrupted(queueResult)) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Could not queue this message",
+              description: chatActionErrorMessage(squashAtomCommandFailure(queueResult)),
+            }),
+          );
+        }
+        return;
+      }
+      toastManager.add(
+        stackedThreadToast({
+          type: "success",
+          title: `Queued for ${snoozeWakeDescription(queueOffer.dispatchAfter, nowMinuteDate, timestampFormat)}`,
+          timeout: 5_000,
+        }),
+      );
       return;
     }
 
@@ -7648,6 +7811,11 @@ function ChatViewContent(props: ChatViewProps) {
                                   : null
                             }
                             isPreparingWorktree={isPreparingWorktree}
+                            queueForLabel={
+                              queueOffer === null
+                                ? null
+                                : `Queue for ${snoozeWakeDescription(queueOffer.dispatchAfter, nowMinuteDate, timestampFormat)}`
+                            }
                             bannerItems={composerBannerItems}
                             environmentUnavailable={activeEnvironmentUnavailableState}
                             activePendingApproval={activePendingApproval}

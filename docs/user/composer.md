@@ -75,6 +75,28 @@ the thread at any time. Snoozing is unavailable while the thread is waiting on y
 message no turn has picked up yet, but the reset time still shows. Dismiss the notice to hide it
 until the next limit, or let it disappear on its own once the reset time passes.
 
+## Queue a message until limits reset
+
+While Claude or Codex reports a usage limit, the send button on web and desktop changes to
+**Queue for** the time your limits come back. Nothing queues on its own — you still choose to
+send, and the button says what will happen.
+
+A queued message waits on the server, so it goes out even with the app closed and whether you
+are connected locally, over your network, or through a tunnel. A notice above the composer shows
+when it will send and gives you **Cancel**, which puts the text back in the composer. Queueing a
+second message replaces the first, because the composer only holds one draft.
+
+Only the text is queued, so the button stays an ordinary send while your draft carries files,
+images, terminal output, or other attached context.
+
+If your message runs into a fresh limit the moment it goes out, it is queued once more for the
+new reset time. A second limit stops it: the message stays on the thread with its Cancel and
+waits for you, rather than retrying forever.
+
+Other agents do not report a reset time, so threads on Cursor, Grok and OpenCode never offer to
+queue. Queueing is a web and desktop feature for now — the mobile app neither offers it nor
+shows a message queued from another device, so cancel one from web or desktop.
+
 ## Prompt stash
 
 Use the default shortcut, `Cmd+S` on macOS or `Ctrl+S` on Windows and Linux, to stash the current

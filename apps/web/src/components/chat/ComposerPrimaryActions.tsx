@@ -27,6 +27,13 @@ interface ComposerPrimaryActionsProps {
   isEnvironmentUnavailable: boolean;
   isPreparingWorktree: boolean;
   hasSendableContent: boolean;
+  /**
+   * Set while the thread's provider is rate limited and the draft can be
+   * parked instead: "Queue for 09:15". Turns send into an explicitly labelled
+   * action, because the one thing this must never do is quietly queue a
+   * message the user meant to send now.
+   */
+  queueForLabel?: string | null;
   preserveComposerFocusOnPointerDown?: boolean;
   /** Enter-to-send is disabled on mobile viewports, where stop would otherwise
    * be the only primary action and a running turn could not be steered. */
@@ -70,6 +77,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   isEnvironmentUnavailable,
   isPreparingWorktree,
   hasSendableContent,
+  queueForLabel = null,
   preserveComposerFocusOnPointerDown = false,
   showSendWhileRunning = false,
   onPreviousPendingQuestion,
@@ -218,7 +226,28 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
     );
   }
 
-  const sendButton = (
+  const isQueueing = queueForLabel !== null;
+  const sendButton = isQueueing ? (
+    <Button
+      type="submit"
+      size="sm"
+      className={cn(
+        "rounded-full bg-message-action text-message-action-foreground hover:bg-message-action-hover",
+        compact ? "h-9 px-3 sm:h-8" : "h-9 px-4 sm:h-8",
+      )}
+      {...pointerFocusProps}
+      disabled={
+        isSendBusy ||
+        isSendDisabled ||
+        isConnecting ||
+        isEnvironmentUnavailable ||
+        !hasSendableContent
+      }
+      aria-label={queueForLabel}
+    >
+      {isConnecting || isSendBusy ? "Queueing..." : queueForLabel}
+    </Button>
+  ) : (
     <button
       type="submit"
       className={cn(

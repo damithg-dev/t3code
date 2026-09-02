@@ -78,3 +78,19 @@ export function queuedTurnStatus(
       return "stalled";
   }
 }
+
+/**
+ * A queued turn carries text only: attachments ride the upload path that
+ * exists for a live turn and nothing else, and pasted contexts are snapshots
+ * of state that will have moved on by the time limits reset. A draft carrying
+ * either keeps its ordinary send.
+ *
+ * Shared by the composer that draws the button and the handler that acts on
+ * it, so the label and the action cannot disagree about what happens next.
+ */
+export function draftCanBeQueued(input: {
+  readonly attachmentCount: number;
+  readonly contextCount: number;
+}): boolean {
+  return input.attachmentCount === 0 && input.contextCount === 0;
+}
