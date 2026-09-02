@@ -532,9 +532,11 @@ export const make = Effect.gen(function* () {
     // path drains, so closing one can never overwrite the main window's bounds.
     if (isMainWindow) {
       flushMainWindowBounds = flushBoundsPersist;
-      yield* previewManager.setMainWindow(window);
     }
 
+    // Every window hosts its own preview guests, so every window registers. The
+    // manager drops it again on `closed`.
+    yield* previewManager.registerWindow(window);
     window.webContents.on("will-attach-webview", (event, webPreferences, params) => {
       if (
         typeof params.partition !== "string" ||
