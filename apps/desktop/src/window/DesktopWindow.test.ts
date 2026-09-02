@@ -198,6 +198,8 @@ const desktopWindowBoundsEquivalence = Schema.toEquivalence(
 
 function makeTestLayer(input: {
   readonly window: Electron.BrowserWindow;
+  /** Returned by `create` after the first window, in order. */
+  readonly additionalWindows?: readonly Electron.BrowserWindow[];
   readonly createCount: Ref.Ref<number>;
   readonly mainWindow: Ref.Ref<Option.Option<Electron.BrowserWindow>>;
   readonly createdWindowOptions?: Electron.BrowserWindowConstructorOptions[];
@@ -246,12 +248,11 @@ function makeTestLayer(input: {
 
   const electronWindowLayer = Layer.succeed(ElectronWindow.ElectronWindow, {
     create: (options) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         input.createdWindowOptions?.push(options);
-      }).pipe(
-        Effect.andThen(Ref.update(input.createCount, (count) => count + 1)),
-        Effect.as(input.window),
-      ),
+        const index = yield* Ref.getAndUpdate(input.createCount, (count) => count + 1);
+        return index === 0 ? input.window : (input.additionalWindows?.[index - 1] ?? input.window);
+      }),
     main: Ref.get(input.mainWindow),
     currentMainOrFirst: Ref.get(input.mainWindow),
     focusedMainOrFirst: Ref.get(input.mainWindow),
@@ -435,6 +436,90 @@ describe("DesktopWindow", () => {
       DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
     );
   });
+
+  it("cascades a secondary window off the focused one and drops the offset at a display edge", () => {
+    const displays = [{ x: 0, y: 0, width: 1920, height: 1080 }];
+    const roomToCascade = { x: 100, y: 100, width: 1200, height: 800 };
+    const flushAgainstTheEdge = { x: 720, y: 280, width: 1200, height: 800 };
+    const offDisplay = { x: 4000, y: 0, width: 1200, height: 800 };
+
+    assert.deepEqual(DesktopWindow.resolveSecondaryWindowBounds(roomToCascade, displays), {
+      x: 124,
+      y: 124,
+      width: 1200,
+      height: 800,
+    });
+    // The cascade would push it off the display, so the new window lands exactly
+    // on top of the focused one rather than half off-screen.
+    assert.deepEqual(
+      DesktopWindow.resolveSecondaryWindowBounds(flushAgainstTheEdge, displays),
+      flushAgainstTheEdge,
+    );
+    assert.deepEqual(
+      DesktopWindow.resolveSecondaryWindowBounds(offDisplay, displays),
+      DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
+    );
+    assert.deepEqual(
+      DesktopWindow.resolveSecondaryWindowBounds(null, displays),
+      DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
+    );
+  });
+
+  it.effect("keeps bounds persistence on the main window after a secondary window opens", () =>
+    Effect.gen(function* () {
+      const mainFake = makeFakeBrowserWindow();
+      mainFake.getBounds.mockReturnValue({ x: 100, y: 100, width: 1200, height: 800 });
+      const secondaryFake = makeFakeBrowserWindow();
+      secondaryFake.getBounds.mockReturnValue({ x: 124, y: 124, width: 1200, height: 800 });
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const createdWindowOptions: Electron.BrowserWindowConstructorOptions[] = [];
+      const mainWindowBoundsUpdates: DesktopAppSettings.DesktopWindowBounds[] = [];
+      const layer = makeTestLayer({
+        window: mainFake.window,
+        additionalWindows: [secondaryFake.window],
+        createCount,
+        mainWindow,
+        createdWindowOptions,
+        mainWindowBoundsUpdates,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        yield* desktopWindow.createSecondary;
+
+        assert.equal(yield* Ref.get(createCount), 2);
+        assert.equal(createdWindowOptions[1]?.x, 124);
+        assert.equal(createdWindowOptions[1]?.y, 124);
+        // Window 1 stays "main": a secondary never re-registers itself.
+        assert.deepEqual(yield* Ref.get(mainWindow), Option.some(mainFake.window));
+        // No bounds listeners means a secondary can neither schedule nor flush a
+        // write to the single persisted bounds record.
+        assert.isUndefined(secondaryFake.windowListeners.get("resize"));
+        assert.isUndefined(secondaryFake.windowListeners.get("move"));
+        assert.isUndefined(secondaryFake.windowListeners.get("close"));
+
+        yield* desktopWindow.flushMainWindowBounds;
+        assert.deepEqual(mainWindowBoundsUpdates, [{ x: 100, y: 100, width: 1200, height: 800 }]);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("ignores a new window request made before the backend is ready", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({ window: fakeWindow.window, createCount, mainWindow });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.createSecondary;
+        assert.equal(yield* Ref.get(createCount), 0);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
 
   it("recognizes only same-origin renderer navigations", () => {
     assert.isTrue(
