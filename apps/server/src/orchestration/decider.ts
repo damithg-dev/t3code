@@ -397,13 +397,13 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.archive": {
-      yield* requireThreadNotArchived({
+      const thread = yield* requireThreadNotArchived({
         readModel,
         command,
         threadId: command.threadId,
       });
       const occurredAt = yield* nowIso;
-      return {
+      const archivedEvent: Omit<OrchestrationEvent, "sequence"> = {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
@@ -417,6 +417,24 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           updatedAt: occurredAt,
         },
       };
+      // Archiving takes the thread out of every active read, including the
+      // sweeper's. A queued turn left behind would be invisible until an
+      // unarchive dropped a stale message into a live thread, so the archive
+      // itself drops it — the way out of the queue, not a silent loss.
+      if (thread.queuedTurn == null) return archivedEvent;
+      return [
+        archivedEvent,
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.turn-dequeued",
+          payload: { threadId: command.threadId, reason: "orphaned", updatedAt: occurredAt },
+        },
+      ];
     }
 
     case "thread.unarchive": {
