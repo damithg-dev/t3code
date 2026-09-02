@@ -220,6 +220,8 @@ interface TestHostWebContents {
   readonly mainFrame: { readonly frameTreeNodeId: number };
   readonly executeJavaScript: ReturnType<typeof vi.fn>;
   readonly isDestroyed: () => boolean;
+  readonly sendInputEvent: ReturnType<typeof vi.fn>;
+  readonly setBackgroundThrottling: ReturnType<typeof vi.fn>;
   readonly session: {
     readonly setDisplayMediaRequestHandler: ReturnType<typeof vi.fn>;
   };
@@ -230,13 +232,15 @@ type TestPreviewWebContents = Electron.WebContents & {
   readonly setBackgroundThrottling: ReturnType<typeof vi.fn<(enabled: boolean) => void>>;
 };
 
-const makeTestHostWebContents = (): TestHostWebContents => {
+const makeTestHostWebContents = (id = 7): TestHostWebContents => {
   let handler: TestDisplayMediaHandler | undefined;
   return {
-    id: 7,
-    mainFrame: { frameTreeNodeId: 7 },
+    id,
+    mainFrame: { frameTreeNodeId: id },
     executeJavaScript: vi.fn(async () => true),
     isDestroyed: () => false,
+    sendInputEvent: vi.fn(),
+    setBackgroundThrottling: vi.fn(),
     session: {
       setDisplayMediaRequestHandler: vi.fn((next: TestDisplayMediaHandler) => {
         handler = next;
@@ -244,6 +248,38 @@ const makeTestHostWebContents = (): TestHostWebContents => {
     },
     displayMediaHandler: () => handler,
   };
+};
+
+/** An app window whose own webContents is `host`, so guests embedded in it resolve back to it. */
+const makeTestAppWindow = (host: TestHostWebContents) => {
+  const listeners = new Map<string, () => void>();
+  return {
+    host,
+    window: {
+      isDestroyed: () => false,
+      once: vi.fn((event: string, listener: () => void) => {
+        listeners.set(event, listener);
+      }),
+      webContents: host,
+    } as never,
+    close: () => listeners.get("closed")?.(),
+  };
+};
+
+const APP_SHORTCUT = {
+  type: "keyDown",
+  key: "k",
+  meta: true,
+  shift: false,
+  control: false,
+  alt: false,
+} as Electron.Input;
+
+const takeBeforeInputListener = (wc: { readonly on: unknown }) => {
+  const on = wc.on as ReturnType<typeof vi.fn>;
+  const registered = on.mock.calls.find(([event]) => event === "before-input-event");
+  if (!registered) throw new Error("Expected a before-input-event listener on the guest.");
+  return registered[1] as (event: { preventDefault: () => void }, input: Electron.Input) => void;
 };
 
 const makeTestPreviewWebContents = (
@@ -4086,6 +4122,148 @@ describe("PreviewManager", () => {
           detailLength: text.length,
           cause: exceptionDetails,
         });
+      }),
+    ),
+  );
+
+  effectIt.effect("attaches a guest hosted by any registered window", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const capturePage = vi.fn(async () => ({
+          toJPEG: () => Buffer.from("frame"),
+          getSize: () => ({ width: 1280, height: 720 }),
+        }));
+        const first = makeTestAppWindow(makeTestHostWebContents(7));
+        const second = makeTestAppWindow(makeTestHostWebContents(8));
+        const stranger = makeTestHostWebContents(9);
+        const webContentsById = new Map([
+          [42, makeTestPreviewWebContents(capturePage, 42, second.host)],
+          [43, makeTestPreviewWebContents(capturePage, 43, stranger)],
+        ]);
+        fromId.mockImplementation((id) =>
+          id === undefined ? null : (webContentsById.get(id) ?? null),
+        );
+        const states: PreviewManager.PreviewTabState[] = [];
+
+        yield* manager.registerWindow(first.window);
+        yield* manager.registerWindow(second.window);
+        yield* manager.subscribeStateChanges((_tabId, state) =>
+          Effect.sync(() => {
+            states.push(state);
+          }),
+        );
+
+        yield* manager.createTab("tab_second_window");
+        yield* manager.registerWebview("tab_second_window", 42);
+        expect(states.at(-1)?.webContentsId).toBe(42);
+
+        // A guest embedded in a window we do not manage is not ours to drive.
+        yield* manager.createTab("tab_foreign_window");
+        const rejected = yield* Effect.exit(manager.registerWebview("tab_foreign_window", 43));
+        expect(Exit.isFailure(rejected)).toBe(true);
+        if (Exit.isFailure(rejected)) {
+          expect(Option.getOrThrow(Cause.findErrorOption(rejected.cause))).toMatchObject({
+            _tag: "PreviewWebContentsNotFoundError",
+            tabId: "tab_foreign_window",
+            webContentsId: 43,
+          });
+        }
+      }),
+    ),
+  );
+
+  effectIt.effect("forwards an app shortcut to the window that owns the guest", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const capturePage = vi.fn(async () => ({
+          toJPEG: () => Buffer.from("frame"),
+          getSize: () => ({ width: 1280, height: 720 }),
+        }));
+        const first = makeTestAppWindow(makeTestHostWebContents(7));
+        const second = makeTestAppWindow(makeTestHostWebContents(8));
+        const guest = makeTestPreviewWebContents(capturePage, 42, second.host);
+        fromId.mockReturnValue(guest);
+
+        yield* manager.registerWindow(first.window);
+        yield* manager.registerWindow(second.window);
+        yield* manager.createTab("tab_shortcut_routing");
+        yield* manager.registerWebview("tab_shortcut_routing", 42);
+
+        const event = { preventDefault: vi.fn() };
+        takeBeforeInputListener(guest)(event, APP_SHORTCUT);
+        yield* Effect.yieldNow;
+
+        expect(event.preventDefault).toHaveBeenCalledOnce();
+        expect(second.host.sendInputEvent.mock.calls).toEqual([
+          [{ type: "keyDown", keyCode: "k", modifiers: ["meta"] }],
+        ]);
+        expect(first.host.sendInputEvent).not.toHaveBeenCalled();
+      }),
+    ),
+  );
+
+  effectIt.effect("drops guest events once their window is gone", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const capturePage = vi.fn(async () => ({
+          toJPEG: () => Buffer.from("frame"),
+          getSize: () => ({ width: 1280, height: 720 }),
+        }));
+        const survivor = makeTestAppWindow(makeTestHostWebContents(7));
+        const closing = makeTestAppWindow(makeTestHostWebContents(8));
+        const webContentsById = new Map([
+          [42, makeTestPreviewWebContents(capturePage, 42, closing.host)],
+          [43, makeTestPreviewWebContents(capturePage, 43, closing.host)],
+        ]);
+        fromId.mockImplementation((id) =>
+          id === undefined ? null : (webContentsById.get(id) ?? null),
+        );
+
+        yield* manager.registerWindow(survivor.window);
+        yield* manager.registerWindow(closing.window);
+        yield* manager.createTab("tab_closing_window");
+        yield* manager.registerWebview("tab_closing_window", 42);
+
+        closing.close();
+
+        // The press is dropped rather than replayed into the surviving window.
+        const event = { preventDefault: vi.fn() };
+        takeBeforeInputListener(webContentsById.get(42)!)(event, APP_SHORTCUT);
+        yield* Effect.yieldNow;
+        expect(event.preventDefault).not.toHaveBeenCalled();
+        expect(closing.host.sendInputEvent).not.toHaveBeenCalled();
+        expect(survivor.host.sendInputEvent).not.toHaveBeenCalled();
+
+        yield* manager.createTab("tab_after_close");
+        const rejected = yield* Effect.exit(manager.registerWebview("tab_after_close", 43));
+        expect(Exit.isFailure(rejected)).toBe(true);
+      }),
+    ),
+  );
+
+  effectIt.effect("keeps frame capture alive while another window is still open", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const capturePage = vi.fn(async () => ({
+          toJPEG: () => Buffer.from("frame"),
+          getSize: () => ({ width: 1280, height: 720 }),
+        }));
+        const survivor = makeTestAppWindow(makeTestHostWebContents(7));
+        const closing = makeTestAppWindow(makeTestHostWebContents(8));
+        fromId.mockReturnValue(makeTestPreviewWebContents(capturePage, 42, survivor.host));
+
+        yield* manager.registerWindow(survivor.window);
+        yield* manager.registerWindow(closing.window);
+        yield* manager.createTab("tab_surviving_capture");
+        yield* manager.registerWebview("tab_surviving_capture", 42);
+        yield* manager.startRecording("tab_surviving_capture");
+
+        closing.close();
+        yield* Effect.yieldNow;
+
+        // Closing one window must not tear down the other window's recording.
+        yield* manager.stopRecording("tab_surviving_capture");
+        expect(survivor.host.setBackgroundThrottling.mock.calls).toEqual([[false], [true]]);
       }),
     ),
   );
