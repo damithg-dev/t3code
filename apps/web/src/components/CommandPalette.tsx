@@ -45,6 +45,7 @@ import {
   FileSearchIcon,
   FolderIcon,
   FolderPlusIcon,
+  LayersIcon,
   LinkIcon,
   MessageSquareIcon,
   PaletteIcon,
@@ -71,7 +72,7 @@ import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
-import { useClientSettings } from "../hooks/useSettings";
+import { useClientSettings, useUpdateClientSettings } from "../hooks/useSettings";
 import { useTheme } from "../hooks/useTheme";
 import { readLocalApi } from "../localApi";
 import { desktopLocalBackendId } from "../connection/desktopLocal";
@@ -580,6 +581,8 @@ function OpenCommandPaletteDialog(props: {
   const isActionsOnly = deferredQuery.startsWith(">");
   const [highlightedItemValue, setHighlightedItemValue] = useState<string | null>(null);
   const clientSettings = useClientSettings();
+  const showWorkspaceFiles = clientSettings.browseShowWorkspaceFiles;
+  const updateClientSettings = useUpdateClientSettings();
   const createProject = useAtomCommand(projectEnvironment.create, {
     reportFailure: false,
   });
@@ -589,6 +592,12 @@ function OpenCommandPaletteDialog(props: {
   const loadBrowsePath = useAtomQueryRunner(filesystemEnvironment.browse, {
     reportFailure: false,
     reportDefect: false,
+  });
+  const scanGitRepos = useAtomQueryRunner(filesystemEnvironment.scanGitRepos, {
+    reportFailure: false,
+  });
+  const readWorkspaceFile = useAtomQueryRunner(filesystemEnvironment.readWorkspaceFile, {
+    reportFailure: false,
   });
   const cloneRepository = useAtomCommand(sourceControlEnvironment.cloneRepository, {
     reportFailure: false,
@@ -976,6 +985,7 @@ function OpenCommandPaletteDialog(props: {
           input: {
             partialPath: browsePath.directoryPath,
             ...(currentProjectCwdForBrowse ? { cwd: currentProjectCwdForBrowse } : {}),
+            ...(showWorkspaceFiles ? { includeWorkspaceFiles: true } : {}),
           },
         })
       : null,
@@ -1789,12 +1799,19 @@ function OpenCommandPaletteDialog(props: {
   });
 
   const handleAddProjectForEnvironment = useCallback(
-    async (input: {
-      readonly environmentId: EnvironmentId;
-      readonly rawCwd: string;
-      readonly platform: string;
-      readonly currentProjectCwd: string | null;
-    }) => {
+    async (
+      input: {
+        readonly environmentId: EnvironmentId;
+        readonly rawCwd: string;
+        readonly platform: string;
+        readonly currentProjectCwd: string | null;
+      },
+      options?: {
+        readonly workspaceFile?: string;
+        readonly repoRoots?: ReadonlyArray<string>;
+        readonly title?: string;
+      },
+    ) => {
       const environment = environments.find(
         (candidate) => candidate.environmentId === input.environmentId,
       );
@@ -1877,12 +1894,40 @@ function OpenCommandPaletteDialog(props: {
         environments.find((environment) => environment.environmentId === input.environmentId)
           ?.serverConfig?.providers ??
         (input.environmentId === primaryEnvironmentId ? providers : []);
+
+      // A `.code-workspace` flow resolves its own repoRoots; only auto-detect
+      // sibling repos when the caller didn't supply an explicit root set.
+      let repoRoots: ReadonlyArray<string> | undefined =
+        options?.repoRoots && options.repoRoots.length > 0 ? options.repoRoots : undefined;
+      let multiRootCount = 0;
+      if (!options?.repoRoots) {
+        const scanResult = await scanGitRepos({
+          environmentId: input.environmentId,
+          input: { parentPath: cwd },
+        });
+        // Scan failure is non-fatal — fall back to a single-root project.
+        if (scanResult._tag === "Success") {
+          const scan = scanResult.value;
+          if (!scan.parentHasGit) {
+            const childRepos = scan.children
+              .filter((child) => child.hasGit)
+              .map((child) => child.absolutePath);
+            if (childRepos.length >= 2) {
+              repoRoots = childRepos;
+              multiRootCount = childRepos.length;
+            }
+          }
+        }
+      }
+
       const createResult = await createProject({
         environmentId: input.environmentId,
         input: {
           projectId,
-          title: inferProjectTitleFromPath(cwd),
+          title: options?.title ?? inferProjectTitleFromPath(cwd),
           workspaceRoot: cwd,
+          ...(options?.workspaceFile ? { workspaceFile: options.workspaceFile } : {}),
+          ...(repoRoots ? { repoRoots } : {}),
           createWorkspaceRootIfMissing: true,
           defaultModelSelection: resolveDefaultProviderModelSelection(
             targetEnvironmentProviders,
@@ -1902,6 +1947,16 @@ function OpenCommandPaletteDialog(props: {
           );
         }
         return;
+      }
+
+      if (multiRootCount > 0) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "info",
+            title: `Added project with ${multiRootCount} repos`,
+            description: `Detected ${multiRootCount} sibling git repositories under ${cwd}.`,
+          }),
+        );
       }
 
       const navigationResult = await settlePromise(() =>
@@ -1924,6 +1979,7 @@ function OpenCommandPaletteDialog(props: {
       handleNewThread,
       createProject,
       environments,
+      scanGitRepos,
       navigate,
       primaryEnvironmentId,
       projects,
@@ -1935,14 +1991,24 @@ function OpenCommandPaletteDialog(props: {
   );
 
   const handleAddProject = useCallback(
-    async (rawCwd: string) => {
+    async (
+      rawCwd: string,
+      options?: {
+        readonly workspaceFile?: string;
+        readonly repoRoots?: ReadonlyArray<string>;
+        readonly title?: string;
+      },
+    ) => {
       if (!browseEnvironmentId) return;
-      await handleAddProjectForEnvironment({
-        environmentId: browseEnvironmentId,
-        rawCwd,
-        platform: browseEnvironmentPlatform,
-        currentProjectCwd: currentProjectCwdForBrowse,
-      });
+      await handleAddProjectForEnvironment(
+        {
+          environmentId: browseEnvironmentId,
+          rawCwd,
+          platform: browseEnvironmentPlatform,
+          currentProjectCwd: currentProjectCwdForBrowse,
+        },
+        options,
+      );
     },
     [
       browseEnvironmentId,
@@ -2158,8 +2224,12 @@ function OpenCommandPaletteDialog(props: {
     canBrowseUp,
     upIcon: <CornerLeftUpIcon className={ITEM_ICON_CLASS} />,
     directoryIcon: <FolderIcon className={ITEM_ICON_CLASS} />,
+    workspaceFileIcon: <LayersIcon className={ITEM_ICON_CLASS} />,
     browseUp,
     browseTo,
+    openWorkspaceFile: (fullPath: string) => {
+      void openWorkspaceFile(fullPath);
+    },
   });
   const cloneDestinationBrowseGroups = useMemo(
     () =>
@@ -2537,16 +2607,85 @@ function OpenCommandPaletteDialog(props: {
         ? "Select"
         : undefined;
 
-  const footerTrailing = canOpenProjectFromFileManager ? (
-    <CommandFooterAction
-      disabled={isPickingProjectFolder}
-      onClick={() => {
-        void handleOpenProjectFromFileManager();
-      }}
-    >
-      {`Open in ${fileManagerName}`}
-    </CommandFooterAction>
-  ) : null;
+  const toggleShowWorkspaceFiles = useCallback(() => {
+    updateClientSettings({ browseShowWorkspaceFiles: !showWorkspaceFiles });
+  }, [showWorkspaceFiles, updateClientSettings]);
+
+  const footerTrailing =
+    (isBrowsing && !relativePathNeedsActiveProject) || canOpenProjectFromFileManager ? (
+      <div className="flex items-center gap-1">
+        {isBrowsing && !relativePathNeedsActiveProject ? (
+          <CommandFooterAction
+            aria-pressed={showWorkspaceFiles}
+            className={cn("gap-1.5", showWorkspaceFiles && "text-foreground")}
+            onClick={toggleShowWorkspaceFiles}
+            title="Toggle showing .code-workspace files while browsing"
+          >
+            <LayersIcon className="size-3.5" />
+            {showWorkspaceFiles ? "Hide .code-workspace" : "Show .code-workspace"}
+          </CommandFooterAction>
+        ) : null}
+        {canOpenProjectFromFileManager ? (
+          <CommandFooterAction
+            disabled={isPickingProjectFolder}
+            onClick={() => {
+              void handleOpenProjectFromFileManager();
+            }}
+          >
+            {`Open in ${fileManagerName}`}
+          </CommandFooterAction>
+        ) : null}
+      </div>
+    ) : null;
+
+  const openWorkspaceFile = useCallback(
+    async (workspaceFilePath: string) => {
+      if (!browseEnvironmentId) {
+        return;
+      }
+
+      const readResult = await readWorkspaceFile({
+        environmentId: browseEnvironmentId,
+        input: { workspaceFilePath },
+      });
+      if (readResult._tag === "Failure") {
+        if (!isAtomCommandInterrupted(readResult)) {
+          const error = squashAtomCommandFailure(readResult);
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Failed to open workspace",
+              description:
+                error instanceof Error ? error.message : "Could not read the .code-workspace file.",
+            }),
+          );
+        }
+        return;
+      }
+      const resolved = readResult.value;
+
+      const missingFolders = resolved.folders.filter((folder) => !folder.exists);
+      if (missingFolders.length > 0) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "warning",
+            title: "Some workspace folders are missing",
+            description: `${missingFolders.length} folder(s) listed in the workspace could not be found and were skipped.`,
+          }),
+        );
+      }
+
+      const fileName = workspaceFilePath.split(/[/\\]/).pop() ?? workspaceFilePath;
+      const title = fileName.replace(/\.code-workspace$/i, "").trim();
+
+      await handleAddProject(resolved.anchorDir, {
+        workspaceFile: resolved.workspaceFilePath,
+        repoRoots: resolved.repoRoots,
+        ...(title.length > 0 ? { title } : {}),
+      });
+    },
+    [browseEnvironmentId, handleAddProject, readWorkspaceFile],
+  );
 
   return (
     <CommandPaletteContent

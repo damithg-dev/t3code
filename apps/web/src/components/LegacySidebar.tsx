@@ -195,6 +195,7 @@ import { useIsMobile } from "~/hooks/useMediaQuery";
 import { CommandDialogTrigger } from "./ui/command";
 import { useClientSettings, useUpdateClientSettings } from "~/hooks/useSettings";
 import { primaryServerKeybindingsAtom } from "../state/server";
+import { ProjectFoldersDialog, type ProjectFoldersDialogTarget } from "./ProjectFoldersDialog";
 import {
   derivePhysicalProjectKey,
   deriveProjectGroupingOverrideKey,
@@ -1234,6 +1235,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     null,
   );
   const [projectRenameTitle, setProjectRenameTitle] = useState("");
+  const [projectFoldersTarget, setProjectFoldersTarget] =
+    useState<ProjectFoldersDialogTarget | null>(null);
   const [projectGroupingTarget, setProjectGroupingTarget] =
     useState<SidebarProjectGroupMember | null>(null);
   const [projectGroupingSelection, setProjectGroupingSelection] = useState<
@@ -1446,6 +1449,22 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     setProjectRenameTitle(member.title);
   }, []);
 
+  const openProjectFoldersDialog = useCallback((member: SidebarProjectGroupMember) => {
+    if (!member.workspaceFile) {
+      return;
+    }
+    setProjectFoldersTarget({
+      environmentId: member.environmentId,
+      projectId: member.id,
+      title: member.title,
+      workspaceFile: member.workspaceFile,
+    });
+  }, []);
+
+  const closeProjectFoldersDialog = useCallback(() => {
+    setProjectFoldersTarget(null);
+  }, []);
+
   const openProjectGroupingDialog = useCallback(
     (member: SidebarProjectGroupMember) => {
       const overrideKey = deriveProjectGroupingOverrideKey(member);
@@ -1629,7 +1648,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 
         const actionHandlers = new Map<string, () => Promise<void> | void>();
         const makeLeaf = (
-          action: "rename" | "grouping" | "copy-path" | "delete",
+          action: "rename" | "manage-folders" | "grouping" | "copy-path" | "delete",
           member: SidebarProjectGroupMember,
           options?: {
             destructive?: boolean;
@@ -1641,6 +1660,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             switch (action) {
               case "rename":
                 openProjectRenameDialog(member);
+                return;
+              case "manage-folders":
+                openProjectFoldersDialog(member);
                 return;
               case "grouping":
                 openProjectGroupingDialog(member);
@@ -1662,7 +1684,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         };
 
         const buildTargetedItem = (
-          action: "rename" | "grouping" | "copy-path" | "delete",
+          action: "rename" | "manage-folders" | "grouping" | "copy-path" | "delete",
           label: string,
           options?: {
             destructive?: boolean;
@@ -1697,6 +1719,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         const clicked = await api.contextMenu.show(
           [
             buildTargetedItem("rename", "Rename"),
+            ...(project.memberProjects.some((member) => member.workspaceFile)
+              ? [
+                  buildTargetedItem("manage-folders", "Manage folders...", {
+                    isDisabled: (member) => !member.workspaceFile,
+                  }),
+                ]
+              : []),
             buildTargetedItem("grouping", "Group into..."),
             buildTargetedItem("copy-path", "Copy Path"),
             buildTargetedItem("delete", "Remove", {
@@ -1719,6 +1748,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     [
       copyPathToClipboard,
       handleRemoveProject,
+      openProjectFoldersDialog,
       openProjectGroupingDialog,
       openProjectRenameDialog,
       project.groupedProjectCount,
@@ -2468,6 +2498,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           </DialogFooter>
         </DialogPopup>
       </Dialog>
+
+      <ProjectFoldersDialog target={projectFoldersTarget} onClose={closeProjectFoldersDialog} />
 
       <Dialog
         open={projectGroupingTarget !== null}
