@@ -414,6 +414,51 @@ export const OrchestrationSession = Schema.Struct({
 });
 export type OrchestrationSession = typeof OrchestrationSession.Type;
 
+/**
+ * Where a queued turn is in its short life.
+ *
+ * - `queued` — parked, waiting for `readyAt` (a minute past the provider's
+ *   reported reset) before the server dispatches it.
+ * - `awaiting` — dispatched; `readyAt` is how long the server keeps watching
+ *   for the dispatch bouncing straight back off a fresh limit.
+ * - `stalled` — the retry also hit a limit. Terminal: the message stays on the
+ *   thread with its cancel, and nothing else fires automatically.
+ */
+export const OrchestrationQueuedTurnState = Schema.Literals(["queued", "awaiting", "stalled"]);
+export type OrchestrationQueuedTurnState = typeof OrchestrationQueuedTurnState.Type;
+
+/**
+ * A turn the user parked while the provider was rate limited, for the server
+ * to send once limits reset. At most one per thread — queueing again replaces
+ * it, because the composer text is the only draft there is.
+ *
+ * Text only: attachments go through the upload/normalize path that only
+ * `thread.turn.start` has, so the composer withholds the queue affordance
+ * while a draft carries any.
+ */
+export const OrchestrationQueuedTurn = Schema.Struct({
+  messageId: MessageId,
+  text: TrimmedNonEmptyString,
+  modelSelection: Schema.optional(ModelSelection),
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  state: OrchestrationQueuedTurnState,
+  /** Meaning depends on `state`; see OrchestrationQueuedTurnState. */
+  readyAt: IsoDateTime,
+  /** Dispatches spent so far. Capped, so a limit that keeps returning stops. */
+  attempts: NonNegativeInt,
+  queuedAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type OrchestrationQueuedTurn = typeof OrchestrationQueuedTurn.Type;
+
+/**
+ * Dispatch attempts a queued turn may spend: the first send plus one
+ * automatic retry when that send lands on a fresh limit. The cap is what
+ * stops a thread bouncing between the queue and the provider forever.
+ */
+export const QUEUED_TURN_MAX_ATTEMPTS = 2;
+
 export const OrchestrationCheckpointFile = Schema.Struct({
   path: TrimmedNonEmptyString,
   kind: TrimmedNonEmptyString,
@@ -557,6 +602,10 @@ export const OrchestrationThread = Schema.Struct({
   activities: Schema.Array(OrchestrationThreadActivity),
   checkpoints: Schema.Array(OrchestrationCheckpointSummary),
   session: Schema.NullOr(OrchestrationSession),
+  // A turn parked until the provider's limits reset. Optional so payloads
+  // from pre-queue servers still decode; absent and null both mean "nothing
+  // queued", never "we could not tell".
+  queuedTurn: Schema.optional(Schema.NullOr(OrchestrationQueuedTurn)),
 });
 export type OrchestrationThread = typeof OrchestrationThread.Type;
 
@@ -617,6 +666,9 @@ export const OrchestrationThreadShell = Schema.Struct({
   pinOrderKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   titleRegeneration: Schema.optional(Schema.NullOr(ThreadTitleRegeneration)),
   session: Schema.NullOr(OrchestrationSession),
+  // See OrchestrationThread.queuedTurn. The shell carries it because the
+  // composer notice and its cancel are the only way back out of a queue.
+  queuedTurn: Schema.optional(Schema.NullOr(OrchestrationQueuedTurn)),
   latestUserMessageAt: Schema.NullOr(IsoDateTime),
   hasPendingApprovals: Schema.Boolean,
   hasPendingUserInput: Schema.Boolean,
@@ -1029,6 +1081,72 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+/**
+ * Parks a turn until the provider's limits reset. Explicit: the composer only
+ * offers this while the thread's session carries a future reset, and never
+ * swaps a send for a queue on its own.
+ *
+ * Queueing again replaces whatever was queued, which is the whole story —
+ * there is one composer draft per thread, so the newer text is the intent.
+ */
+const ThreadTurnQueueCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.queue"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  message: Schema.Struct({
+    messageId: MessageId,
+    text: TrimmedNonEmptyString,
+  }),
+  modelSelection: Schema.optional(ModelSelection),
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  /** Earliest instant the server may send it: the reset plus a skew guard. */
+  dispatchAfter: IsoDateTime,
+  createdAt: IsoDateTime,
+});
+
+/** The way back out: cancel returns the text to the composer draft. */
+const ThreadTurnDequeueCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.dequeue"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  createdAt: IsoDateTime,
+});
+
+/** Sends the queued turn. Server-issued once `readyAt` passes. */
+const ThreadQueuedTurnDispatchCommand = Schema.Struct({
+  type: Schema.Literal("thread.queued-turn.dispatch"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  createdAt: IsoDateTime,
+});
+
+/**
+ * Re-parks a dispatched turn that walked straight into a fresh limit.
+ * `dispatchAfter: null` means the attempts are spent: the turn goes to
+ * `stalled` and waits for the user instead of retrying again.
+ */
+const ThreadQueuedTurnRescheduleCommand = Schema.Struct({
+  type: Schema.Literal("thread.queued-turn.reschedule"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  dispatchAfter: Schema.NullOr(IsoDateTime),
+  createdAt: IsoDateTime,
+});
+
+/**
+ * Drops a queued turn the user did not cancel: `dispatched` once a sent turn
+ * has survived its watch window, `orphaned` when the thread it belonged to is
+ * gone. Never silent on the client — the notice disappears with a reason.
+ */
+const ThreadQueuedTurnReleaseCommand = Schema.Struct({
+  type: Schema.Literal("thread.queued-turn.release"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  reason: Schema.Literals(["dispatched", "orphaned"]),
+  createdAt: IsoDateTime,
+});
+
 const ThreadTurnInterruptCommand = Schema.Struct({
   type: Schema.Literal("thread.turn.interrupt"),
   commandId: CommandId,
@@ -1095,6 +1213,8 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
   ThreadTurnStartCommand,
+  ThreadTurnQueueCommand,
+  ThreadTurnDequeueCommand,
   ThreadTurnInterruptCommand,
   ThreadApprovalRespondCommand,
   ThreadUserInputRespondCommand,
@@ -1123,6 +1243,8 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
   ClientThreadTurnStartCommand,
+  ThreadTurnQueueCommand,
+  ThreadTurnDequeueCommand,
   ThreadTurnInterruptCommand,
   ThreadApprovalRespondCommand,
   ThreadUserInputRespondCommand,
@@ -1241,6 +1363,9 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadAutoSettleCommand,
   ThreadSessionSetCommand,
   ThreadSessionRateLimitSetCommand,
+  ThreadQueuedTurnDispatchCommand,
+  ThreadQueuedTurnRescheduleCommand,
+  ThreadQueuedTurnReleaseCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
   ThreadProposedPlanUpsertCommand,
@@ -1277,6 +1402,8 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.interaction-mode-set",
   "thread.message-sent",
   "thread.turn-start-requested",
+  "thread.turn-queued",
+  "thread.turn-dequeued",
   "thread.turn-interrupt-requested",
   "thread.approval-response-requested",
   "thread.user-input-response-requested",
@@ -1467,6 +1594,22 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   ),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   createdAt: IsoDateTime,
+});
+
+export const ThreadTurnQueuedPayload = Schema.Struct({
+  threadId: ThreadId,
+  /** Total write of the record: queue, reschedule and dispatch all replay it. */
+  queuedTurn: OrchestrationQueuedTurn,
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadTurnDequeuedPayload = Schema.Struct({
+  threadId: ThreadId,
+  // cancelled: the user took the text back. dispatched: the sent turn stuck.
+  // orphaned: the thread or its session went away underneath the queue, so
+  // the turn is dropped visibly instead of firing into nothing.
+  reason: Schema.Literals(["cancelled", "dispatched", "orphaned"]),
+  updatedAt: IsoDateTime,
 });
 
 export const ThreadTurnInterruptRequestedPayload = Schema.Struct({
@@ -1661,6 +1804,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.turn-start-requested"),
     payload: ThreadTurnStartRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.turn-queued"),
+    payload: ThreadTurnQueuedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.turn-dequeued"),
+    payload: ThreadTurnDequeuedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
