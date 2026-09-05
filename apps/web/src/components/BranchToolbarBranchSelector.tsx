@@ -37,6 +37,7 @@ import { getSourceControlPresentation } from "../sourceControlPresentation";
 import { composerFloatingLayerProps } from "./chat/composerEventScope";
 import {
   deriveLocalBranchNameFromRemoteRef,
+  resolveAnchorRepoRoot,
   resolveBranchTriggerLabel,
   resolveBranchToolbarPrBranch,
   resolveBranchSelectionTarget,
@@ -139,7 +140,15 @@ export function BranchToolbarBranchSelector({
       ? activeThreadBranchOverride
       : (serverThread?.branch ?? draftThread?.branch ?? null);
   const activeWorktreePath = serverThread?.worktreePath ?? draftThread?.worktreePath ?? null;
-  const activeProjectCwd = activeProject?.workspaceRoot ?? null;
+  // Git commands need a repo, and a workspace-file project's `workspaceRoot` is
+  // just the directory holding the `.code-workspace` — usually not a repo, which
+  // left every ref query here reporting `isRepo: false` and an empty selector.
+  const activeProjectCwd = activeProject
+    ? resolveAnchorRepoRoot({
+        workspaceRoot: activeProject.workspaceRoot,
+        repoRoots: activeProject.repoRoots,
+      })
+    : null;
   const branchCwd = activeWorktreePath ?? activeProjectCwd;
   const hasServerThread = serverThread !== null;
   const effectiveEnvMode =

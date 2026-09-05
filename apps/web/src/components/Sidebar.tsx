@@ -49,6 +49,8 @@ import {
   FolderIcon,
   FolderPlusIcon,
   GitBranchIcon,
+  LayersIcon,
+  MessageSquareIcon,
   PinIcon,
   PlusIcon,
   SearchIcon,
@@ -145,6 +147,7 @@ import {
   planPinnedReorder,
   reduceSidebarProjectScopeMenuState,
   resolveAdjacentThreadId,
+  resolveSidebarProjectRepoInfo,
   resolveSidebarThreadStatus,
   searchSidebarThreadsByTitle,
   shouldCreateNewThreadInCurrentProject,
@@ -157,6 +160,7 @@ import {
   useRetainedValue,
   useSidebarRowSubscriptionLease,
   useThreadJumpHintVisibility,
+  type SidebarProjectRepoInfo,
 } from "./Sidebar.logic";
 import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
 import {
@@ -287,6 +291,7 @@ function SidebarThreadTooltip({
   projectCwd,
   projectFaviconPath,
   projectIcon,
+  projectRepoInfo,
   environmentLabel,
   environmentMachine,
   providerEntry,
@@ -303,6 +308,7 @@ function SidebarThreadTooltip({
   projectCwd: string | null;
   projectFaviconPath: string | null;
   projectIcon: ProjectIconOverride | null;
+  projectRepoInfo: SidebarProjectRepoInfo | null;
   environmentLabel: string | null;
   environmentMachine: EnvironmentMachineKind;
   providerEntry: ProviderInstanceEntry | null;
@@ -338,7 +344,8 @@ function SidebarThreadTooltip({
                 projectName={projectTitle ?? ""}
                 faviconPath={projectFaviconPath}
                 projectIcon={projectIcon}
-                className="size-3 shrink-0"
+                className="size-3 shrink-0 stroke-muted-foreground"
+                {...(projectRepoInfo?.isWorkspace ? { fallbackIcon: LayersIcon } : {})}
               />
               <div className="min-w-0 truncate text-foreground/75">{projectDisplayName}</div>
             </div>
@@ -515,6 +522,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   projectCwd: string | null;
   projectFaviconPath: string | null;
   projectIcon: ProjectIconOverride | null;
+  projectRepoInfo: SidebarProjectRepoInfo | null;
   isActive: boolean;
   onNavigate: (draftId: DraftId) => void;
   onDiscard: (draftId: DraftId) => void;
@@ -579,6 +587,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
               faviconPath={props.projectFaviconPath}
               projectIcon={props.projectIcon}
               className="size-4 shrink-0"
+              {...(props.projectRepoInfo?.isWorkspace ? { fallbackIcon: LayersIcon } : {})}
             />
             <span className="min-w-0 flex-1 truncate text-xs font-medium text-secondary-label">
               {props.projectDisplayName}
@@ -624,6 +633,7 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
   projectCwdByKey: ReadonlyMap<string, string>;
   projectFaviconPathByKey: ReadonlyMap<string, string | null | undefined>;
   projectIconByKey: ReadonlyMap<string, ProjectIconOverride | null | undefined>;
+  projectRepoInfoByKey: ReadonlyMap<string, SidebarProjectRepoInfo>;
   scopedProjectKeys: ReadonlySet<string> | null;
   routeDraftId: string | null;
   onNavigateToDraft: (draftId: DraftId) => void;
@@ -722,6 +732,7 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
             projectCwd={props.projectCwdByKey.get(projectKey) ?? null}
             projectFaviconPath={props.projectFaviconPathByKey.get(projectKey) ?? null}
             projectIcon={props.projectIconByKey.get(projectKey) ?? null}
+            projectRepoInfo={props.projectRepoInfoByKey.get(projectKey) ?? null}
             isActive={draftId === props.routeDraftId}
             onNavigate={props.onNavigateToDraft}
             onDiscard={handleDiscard}
@@ -770,6 +781,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   projectCwd: string | null;
   projectFaviconPath: string | null;
   projectIcon: ProjectIconOverride | null;
+  projectRepoInfo: SidebarProjectRepoInfo | null;
   projectTitle: string | null;
   projectDisplayName: string | null;
   providerEntryByInstanceId: ReadonlyMap<string, ProviderInstanceEntry>;
@@ -848,7 +860,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
     [clearComposerContent, threadRef],
   );
 
-  const gitCwd = thread.worktreePath ?? props.projectCwd;
+  // A multi-repo workspace's `projectCwd` is the container folder, which is not
+  // a repo; its anchor root is. Isolated runs still report on the anchor
+  // worktree only — the per-root map lives on `thread.worktrees`.
+  const gitCwd = thread.worktreePath ?? props.projectRepoInfo?.gitRoot ?? props.projectCwd;
   const linkedPullRequestStatus = useLinkedThreadPullRequest(
     leaseLiveStatus ? thread.environmentId : null,
     leaseLiveStatus ? thread.linkedPullRequest : null,
@@ -1025,6 +1040,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
       projectCwd={props.projectCwd}
       projectFaviconPath={props.projectFaviconPath}
       projectIcon={props.projectIcon}
+      projectRepoInfo={props.projectRepoInfo}
       environmentLabel={props.environmentLabel}
       environmentMachine={props.environmentMachine}
       providerEntry={providerEntry}
@@ -1518,6 +1534,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                 faviconPath={props.projectFaviconPath}
                 projectIcon={props.projectIcon}
                 className="size-4 shrink-0"
+                {...(props.projectRepoInfo?.isWorkspace ? { fallbackIcon: LayersIcon } : {})}
               />
               {props.projectDisplayName ? (
                 <span
@@ -1741,6 +1758,7 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
   projectCwd: string | null;
   projectFaviconPath: string | null;
   projectIcon: ProjectIconOverride | null;
+  projectRepoInfo: SidebarProjectRepoInfo | null;
   projectTitle: string | null;
   projectDisplayName: string | null;
   environmentLabel: string | null;
@@ -1758,7 +1776,8 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
   );
   // Same details tooltip as the regular rows: a search hit is still a thread,
   // and the hover card is how you disambiguate identically-titled results.
-  const gitCwd = thread.worktreePath ?? props.projectCwd;
+  // Anchor root, not the workspace container — see SidebarThreadRow.
+  const gitCwd = thread.worktreePath ?? props.projectRepoInfo?.gitRoot ?? props.projectCwd;
   const gitStatus = useEnvironmentQuery(
     leaseLiveStatus && (thread.branch != null || thread.worktreePath !== null) && gitCwd !== null
       ? vcsEnvironment.status({
@@ -1844,6 +1863,7 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
           projectCwd={props.projectCwd}
           projectFaviconPath={props.projectFaviconPath}
           projectIcon={props.projectIcon}
+          projectRepoInfo={props.projectRepoInfo}
           environmentLabel={props.environmentLabel}
           environmentMachine={props.environmentMachine}
           providerEntry={providerEntry}
@@ -2054,6 +2074,16 @@ export default function Sidebar() {
         projects.map((project) => [
           `${project.environmentId}:${project.id}`,
           project.workspaceRoot,
+        ]),
+      ),
+    [projects],
+  );
+  const projectRepoInfoByKey = useMemo(
+    () =>
+      new Map(
+        projects.map((project) => [
+          `${project.environmentId}:${project.id}`,
+          resolveSidebarProjectRepoInfo(project),
         ]),
       ),
     [projects],
@@ -3764,6 +3794,9 @@ export default function Sidebar() {
                           projectName={scopedProjectGroup.title}
                           faviconPath={scopedProjectGroup.faviconPath}
                           projectIcon={scopedProjectGroup.projectIcon}
+                          {...(scopedProjectGroup.workspaceFile
+                            ? { fallbackIcon: LayersIcon }
+                            : {})}
                           className="size-4"
                         />
                       </span>
@@ -3843,6 +3876,7 @@ export default function Sidebar() {
                                 projectName={project.title}
                                 faviconPath={project.faviconPath}
                                 projectIcon={project.projectIcon}
+                                {...(project.workspaceFile ? { fallbackIcon: LayersIcon } : {})}
                                 className="size-4 shrink-0"
                               />
                             ) : (
@@ -3929,6 +3963,10 @@ export default function Sidebar() {
                         }
                         projectIcon={
                           projectIconByKey.get(`${thread.environmentId}:${thread.projectId}`) ??
+                          null
+                        }
+                        projectRepoInfo={
+                          projectRepoInfoByKey.get(`${thread.environmentId}:${thread.projectId}`) ??
                           null
                         }
                         projectTitle={
@@ -4057,6 +4095,10 @@ export default function Sidebar() {
                           projectIconByKey.get(`${thread.environmentId}:${thread.projectId}`) ??
                           null
                         }
+                        projectRepoInfo={
+                          projectRepoInfoByKey.get(`${thread.environmentId}:${thread.projectId}`) ??
+                          null
+                        }
                         projectTitle={
                           projectTitleByKey.get(`${thread.environmentId}:${thread.projectId}`) ??
                           null
@@ -4106,6 +4148,7 @@ export default function Sidebar() {
                       projectCwdByKey={projectCwdByKey}
                       projectFaviconPathByKey={projectFaviconPathByKey}
                       projectIconByKey={projectIconByKey}
+                      projectRepoInfoByKey={projectRepoInfoByKey}
                       scopedProjectKeys={scopedProjectKeys}
                       routeDraftId={routeDraftIdForRows}
                       onNavigateToDraft={navigateToDraft}
