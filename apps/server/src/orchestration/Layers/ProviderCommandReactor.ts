@@ -49,7 +49,11 @@ import {
   type ProviderCommandReactorShape,
 } from "../Services/ProviderCommandReactor.ts";
 import { forkParked, ServerActivation } from "../../serverActivation.ts";
-import { canReplaceThreadTitle, DEFAULT_THREAD_TITLE } from "../threadTitles.ts";
+import {
+  canReplaceThreadTitle,
+  DEFAULT_THREAD_TITLE,
+  deriveThreadTitleFromIssueKey,
+} from "../threadTitles.ts";
 import {
   resolveSourceControlWriterModelSelection,
   ServerSettingsService,
@@ -974,6 +978,27 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const setThreadTitleFromIssueKey = Effect.fn("setThreadTitleFromIssueKey")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly title: string;
+  }) {
+    yield* orchestrationEngine
+      .dispatch({
+        type: "thread.meta.update",
+        commandId: yield* serverCommandId("thread-title-issue-key"),
+        threadId: input.threadId,
+        title: input.title,
+      })
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("provider command reactor failed to set thread title from issue key", {
+            threadId: input.threadId,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      );
+  });
+
   const maybeGenerateThreadTitleForFirstTurn = Effect.fn("maybeGenerateThreadTitleForFirstTurn")(
     function* (input: {
       readonly threadId: ThreadId;
@@ -1337,11 +1362,22 @@ const make = Effect.gen(function* () {
       }).pipe(Effect.forkScoped);
 
       if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
-        yield* maybeGenerateThreadTitleForFirstTurn({
-          threadId: event.payload.threadId,
-          cwd: generationCwd,
-          ...generationInput,
-        }).pipe(Effect.forkScoped);
+        // A first message that names an issue has already titled the thread.
+        // Taking the key verbatim beats a model's paraphrase of it, so the
+        // generation call is skipped rather than made and thrown away.
+        const issueKeyTitle = deriveThreadTitleFromIssueKey(message.text);
+        yield* (
+          issueKeyTitle === null
+            ? maybeGenerateThreadTitleForFirstTurn({
+                threadId: event.payload.threadId,
+                cwd: generationCwd,
+                ...generationInput,
+              })
+            : setThreadTitleFromIssueKey({
+                threadId: event.payload.threadId,
+                title: issueKeyTitle,
+              })
+        ).pipe(Effect.forkScoped);
       }
     }
 
