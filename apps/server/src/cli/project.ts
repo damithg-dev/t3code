@@ -34,6 +34,7 @@ import {
   clearPersistedServerRuntimeState,
   readPersistedServerRuntimeState,
 } from "../serverRuntimeState.ts";
+import { makeWorkspaceFile, type ResolvedWorkspaceFile } from "../workspace/WorkspaceFile.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import { type CliAuthLocationFlags, projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
@@ -44,10 +45,17 @@ type ProjectMutationTarget = {
 };
 
 type ProjectCommandExecutionMode = "live" | "offline";
-type ProjectCliDispatchCommand = Extract<
+export type ProjectCliDispatchCommand = Extract<
   ClientOrchestrationCommand,
   { type: "project.create" | "project.meta.update" | "project.delete" }
 >;
+
+/** Dispatches one project command, live over HTTP or offline through the engine. */
+type ProjectCliDispatch = (
+  command: ProjectCliDispatchCommand,
+) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
+
+const WORKSPACE_FILE_EXTENSION = ".code-workspace";
 
 const isEnvironmentHttpCommonError = Schema.is(EnvironmentHttpCommonError);
 
@@ -147,10 +155,26 @@ export class ProjectAlreadyExistsError extends Schema.TaggedErrorClass<ProjectAl
     operation: Schema.Literal("addProject"),
     projectId: ProjectId,
     workspaceRoot: Schema.String,
+    workspaceFile: Schema.optional(Schema.String),
   },
 ) {
   override get message(): string {
-    return `An active project already exists for '${this.workspaceRoot}'.`;
+    return this.workspaceFile === undefined
+      ? `An active project already exists for '${this.workspaceRoot}'.`
+      : `An active project already exists for '${this.workspaceFile}'.`;
+  }
+}
+
+export class ProjectWorkspaceFileEmptyError extends Schema.TaggedErrorClass<ProjectWorkspaceFileEmptyError>()(
+  "ProjectWorkspaceFileEmptyError",
+  {
+    operation: Schema.Literal("resolveWorkspaceFile"),
+    workspaceFile: Schema.String,
+    folderCount: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Workspace file '${this.workspaceFile}' resolves no git repositories (${this.folderCount} folder(s) listed).`;
   }
 }
 
@@ -163,6 +187,7 @@ export const ProjectCommandError = Schema.Union([
   ProjectIdentifierEmptyError,
   ProjectNotFoundError,
   ProjectAlreadyExistsError,
+  ProjectWorkspaceFileEmptyError,
 ]);
 export type ProjectCommandError = typeof ProjectCommandError.Type;
 
@@ -234,8 +259,9 @@ const normalizeWorkspaceRootForProjectCommand = Effect.fn(
   return yield* workspacePaths.normalizeWorkspaceRoot(workspaceRoot);
 });
 
+/** Validates an explicit title, falling back to the caller's derived default. */
 const resolveProjectTitle = Effect.fn("resolveProjectTitle")(function* (
-  workspaceRoot: string,
+  defaultTitle: string,
   explicitTitle?: string,
 ) {
   if (explicitTitle !== undefined) {
@@ -249,10 +275,113 @@ const resolveProjectTitle = Effect.fn("resolveProjectTitle")(function* (
     });
   }
 
-  const path = yield* Path.Path;
-  const basename = path.basename(workspaceRoot).trim();
-  return basename.length > 0 ? basename : "project";
+  const trimmedDefault = defaultTitle.trim();
+  return trimmedDefault.length > 0 ? trimmedDefault : "project";
 });
+
+function isWorkspaceFilePath(candidate: string): boolean {
+  return candidate.trim().toLowerCase().endsWith(WORKSPACE_FILE_EXTENSION);
+}
+
+/** `/repos/BabyJourney.code-workspace` -> `BabyJourney`, like the palette does. */
+function workspaceFileTitle(workspaceFilePath: string, path: Path.Path): string {
+  const fileName = path.basename(workspaceFilePath);
+  const stripped = fileName.slice(0, fileName.length - WORKSPACE_FILE_EXTENSION.length).trim();
+  return stripped.length > 0 ? stripped : fileName;
+}
+
+const readProjectWorkspaceFile = Effect.fn("readProjectWorkspaceFile")(function* (
+  workspaceFilePath: string,
+) {
+  const workspaceFile = yield* makeWorkspaceFile;
+  return yield* workspaceFile.read(workspaceFilePath);
+});
+
+/**
+ * Folders a workspace file lists but cannot contribute as repo roots. Surfaced
+ * to the operator rather than silently collapsed into the repo-root list.
+ */
+function workspaceFolderWarnings(resolved: ResolvedWorkspaceFile): ReadonlyArray<string> {
+  const missing = resolved.folders.filter((folder) => !folder.exists);
+  const nonGit = resolved.folders.filter((folder) => folder.exists && !folder.isGit);
+  return [
+    ...(missing.length > 0
+      ? [`Missing folders: ${missing.map((folder) => folder.absolutePath).join(", ")}.`]
+      : []),
+    ...(nonGit.length > 0
+      ? [
+          `Folders without a git repository: ${nonGit.map((folder) => folder.absolutePath).join(", ")}.`,
+        ]
+      : []),
+  ];
+}
+
+export type ProjectAddTarget = {
+  readonly workspaceRoot: string;
+  readonly workspaceFile?: string;
+  readonly repoRoots?: ReadonlyArray<string>;
+  readonly defaultTitle: string;
+  readonly warnings: ReadonlyArray<string>;
+};
+
+/**
+ * A `.code-workspace` path anchors the project at the file's directory and
+ * carries the file's git folders as `repoRoots`, mirroring what the palette's
+ * open-workspace flow dispatches. Any other path stays a plain folder project.
+ */
+export const resolveProjectAddTarget = Effect.fn("resolveProjectAddTarget")(function* (
+  projectPath: string,
+) {
+  const path = yield* Path.Path;
+
+  if (!isWorkspaceFilePath(projectPath)) {
+    const workspaceRoot = yield* normalizeWorkspaceRootForProjectCommand(projectPath);
+    return {
+      workspaceRoot,
+      defaultTitle: path.basename(workspaceRoot),
+      warnings: [],
+    } satisfies ProjectAddTarget;
+  }
+
+  const resolved = yield* readProjectWorkspaceFile(projectPath);
+  const workspaceRoot = yield* normalizeWorkspaceRootForProjectCommand(resolved.anchorDir);
+  return {
+    workspaceRoot,
+    workspaceFile: resolved.workspaceFilePath,
+    repoRoots: resolved.repoRoots,
+    defaultTitle: workspaceFileTitle(resolved.workspaceFilePath, path),
+    warnings: workspaceFolderWarnings(resolved),
+  } satisfies ProjectAddTarget;
+});
+
+export type ProjectWorkspaceFileUpdate = {
+  readonly workspaceFile: string;
+  readonly repoRoots: ReadonlyArray<string>;
+  readonly warnings: ReadonlyArray<string>;
+};
+
+/**
+ * Validates a `.code-workspace` before it is attached to an existing project.
+ * A file that resolves no git repositories would leave the project without a
+ * single usable checkout, so it fails instead of writing an empty root list.
+ */
+export const resolveProjectWorkspaceFileUpdate = Effect.fn("resolveProjectWorkspaceFileUpdate")(
+  function* (workspaceFilePath: string) {
+    const resolved = yield* readProjectWorkspaceFile(workspaceFilePath);
+    if (resolved.repoRoots.length === 0) {
+      return yield* new ProjectWorkspaceFileEmptyError({
+        operation: "resolveWorkspaceFile",
+        workspaceFile: resolved.workspaceFilePath,
+        folderCount: resolved.folders.length,
+      });
+    }
+    return {
+      workspaceFile: resolved.workspaceFilePath,
+      repoRoots: resolved.repoRoots,
+      warnings: workspaceFolderWarnings(resolved),
+    } satisfies ProjectWorkspaceFileUpdate;
+  },
+);
 
 const findActiveProjectTarget = Effect.fn("findActiveProjectTarget")(function* (input: {
   readonly snapshot: OrchestrationReadModel;
@@ -377,9 +506,7 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
   flags: CliAuthLocationFlags,
   run: (input: {
     readonly snapshot: OrchestrationReadModel;
-    readonly dispatch: (
-      command: ProjectCliDispatchCommand,
-    ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
+    readonly dispatch: ProjectCliDispatch;
     readonly mode: ProjectCommandExecutionMode;
   }) => Effect.Effect<
     string,
@@ -440,49 +567,68 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
   );
 });
 
+export const projectAddMutation = Effect.fn("projectAddMutation")(function* (input: {
+  readonly snapshot: OrchestrationReadModel;
+  readonly dispatch: ProjectCliDispatch;
+  readonly projectPath: string;
+  readonly title?: string | undefined;
+}) {
+  const target = yield* resolveProjectAddTarget(input.projectPath);
+  // A `.code-workspace` anchored at an existing folder project's root is a
+  // different project, so identity is the root plus the workspace file.
+  const existingProject = input.snapshot.projects.find(
+    (project) =>
+      project.deletedAt === null &&
+      project.workspaceRoot === target.workspaceRoot &&
+      (project.workspaceFile ?? null) === (target.workspaceFile ?? null),
+  );
+  if (existingProject) {
+    return yield* new ProjectAlreadyExistsError({
+      operation: "addProject",
+      projectId: existingProject.id,
+      workspaceRoot: target.workspaceRoot,
+      ...(target.workspaceFile === undefined ? {} : { workspaceFile: target.workspaceFile }),
+    });
+  }
+
+  const title = yield* resolveProjectTitle(target.defaultTitle, input.title);
+  const projectId = ProjectId.make(yield* projectCommandUuid);
+  yield* input.dispatch({
+    type: "project.create",
+    commandId: CommandId.make(yield* projectCommandUuid),
+    projectId,
+    title,
+    workspaceRoot: target.workspaceRoot,
+    ...(target.workspaceFile === undefined ? {} : { workspaceFile: target.workspaceFile }),
+    ...(target.repoRoots && target.repoRoots.length > 0 ? { repoRoots: target.repoRoots } : {}),
+    createdAt: DateTime.formatIso(yield* DateTime.now),
+  });
+
+  return [
+    `Added project ${projectId} (${title}) at ${target.workspaceRoot}.`,
+    ...(target.workspaceFile === undefined ? [] : [`Workspace file: ${target.workspaceFile}`]),
+    ...(target.repoRoots && target.repoRoots.length > 0
+      ? [`Repo roots (${target.repoRoots.length}): ${target.repoRoots.join(", ")}`]
+      : []),
+    ...target.warnings.map((warning) => `Warning: ${warning}`),
+  ].join("\n");
+});
+
 const projectAddCommand = Command.make("add", {
   ...projectLocationFlags,
-  workspaceRoot: Argument.string("path").pipe(
-    Argument.withDescription("Workspace root to add as a project."),
+  projectPath: Argument.string("path").pipe(
+    Argument.withDescription("Workspace root, or a .code-workspace file, to add as a project."),
   ),
   title: Flag.string("title").pipe(Flag.withDescription("Optional project title."), Flag.optional),
 }).pipe(
   Command.withDescription("Add a project."),
   Command.withHandler((flags) =>
-    runProjectMutation(
-      flags,
-      Effect.fn("projectAddMutation")(function* ({
+    runProjectMutation(flags, ({ snapshot, dispatch }) =>
+      projectAddMutation({
         snapshot,
         dispatch,
-      }: {
-        readonly snapshot: OrchestrationReadModel;
-        readonly dispatch: (
-          command: ProjectCliDispatchCommand,
-        ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
-      }) {
-        const workspaceRoot = yield* normalizeWorkspaceRootForProjectCommand(flags.workspaceRoot);
-        const existingProject = snapshot.projects.find(
-          (project) => project.deletedAt === null && project.workspaceRoot === workspaceRoot,
-        );
-        if (existingProject) {
-          return yield* new ProjectAlreadyExistsError({
-            operation: "addProject",
-            projectId: existingProject.id,
-            workspaceRoot,
-          });
-        }
-
-        const title = yield* resolveProjectTitle(workspaceRoot, Option.getOrUndefined(flags.title));
-        const projectId = ProjectId.make(yield* projectCommandUuid);
-        yield* dispatch({
-          type: "project.create",
-          commandId: CommandId.make(yield* projectCommandUuid),
-          projectId,
-          title,
-          workspaceRoot,
-          createdAt: DateTime.formatIso(yield* DateTime.now),
-        });
-        return `Added project ${projectId} (${title}) at ${workspaceRoot}.`;
+        projectPath: flags.projectPath,
+        title: Option.getOrUndefined(flags.title),
       }),
     ),
   ),
@@ -507,9 +653,7 @@ const projectRemoveCommand = Command.make("remove", {
         dispatch,
       }: {
         readonly snapshot: OrchestrationReadModel;
-        readonly dispatch: (
-          command: ProjectCliDispatchCommand,
-        ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
+        readonly dispatch: ProjectCliDispatch;
       }) {
         const project = yield* findActiveProjectTarget({
           snapshot,
@@ -543,15 +687,13 @@ const projectRenameCommand = Command.make("rename", {
         dispatch,
       }: {
         readonly snapshot: OrchestrationReadModel;
-        readonly dispatch: (
-          command: ProjectCliDispatchCommand,
-        ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
+        readonly dispatch: ProjectCliDispatch;
       }) {
         const project = yield* findActiveProjectTarget({
           snapshot,
           identifier: flags.project,
         });
-        const nextTitle = yield* resolveProjectTitle(project.workspaceRoot, flags.title);
+        const nextTitle = yield* resolveProjectTitle(project.title, flags.title);
         if (nextTitle === project.title) {
           return `Project ${project.id} is already named ${nextTitle}.`;
         }
@@ -568,7 +710,63 @@ const projectRenameCommand = Command.make("rename", {
   ),
 );
 
+export const projectSetWorkspaceMutation = Effect.fn("projectSetWorkspaceMutation")(
+  function* (input: {
+    readonly snapshot: OrchestrationReadModel;
+    readonly dispatch: ProjectCliDispatch;
+    readonly identifier: string;
+    readonly workspaceFilePath: string;
+  }) {
+    const project = yield* findActiveProjectTarget({
+      snapshot: input.snapshot,
+      identifier: input.identifier,
+    });
+    const update = yield* resolveProjectWorkspaceFileUpdate(input.workspaceFilePath);
+
+    yield* input.dispatch({
+      type: "project.meta.update",
+      commandId: CommandId.make(yield* projectCommandUuid),
+      projectId: project.id,
+      workspaceFile: update.workspaceFile,
+      repoRoots: update.repoRoots,
+    });
+
+    return [
+      `Project ${project.id} (${project.title}) now uses ${update.workspaceFile}.`,
+      `Repo roots (${update.repoRoots.length}): ${update.repoRoots.join(", ")}`,
+      ...update.warnings.map((warning) => `Warning: ${warning}`),
+    ].join("\n");
+  },
+);
+
+const projectSetWorkspaceCommand = Command.make("set-workspace", {
+  ...projectLocationFlags,
+  project: Argument.string("project").pipe(
+    Argument.withDescription("Project id or workspace root to update."),
+  ),
+  workspaceFile: Argument.string("workspace-file").pipe(
+    Argument.withDescription("Path to the .code-workspace file backing the project."),
+  ),
+}).pipe(
+  Command.withDescription("Back a project with a .code-workspace file."),
+  Command.withHandler((flags) =>
+    runProjectMutation(flags, ({ snapshot, dispatch }) =>
+      projectSetWorkspaceMutation({
+        snapshot,
+        dispatch,
+        identifier: flags.project,
+        workspaceFilePath: flags.workspaceFile,
+      }),
+    ),
+  ),
+);
+
 export const projectCommand = Command.make("project").pipe(
   Command.withDescription("Manage projects."),
-  Command.withSubcommands([projectAddCommand, projectRemoveCommand, projectRenameCommand]),
+  Command.withSubcommands([
+    projectAddCommand,
+    projectRemoveCommand,
+    projectRenameCommand,
+    projectSetWorkspaceCommand,
+  ]),
 );
