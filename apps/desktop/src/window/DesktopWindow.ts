@@ -13,6 +13,7 @@ import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts";
 import * as DesktopAssets from "../app/DesktopAssets.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import { makeComponentLogger } from "../app/DesktopObservability.ts";
+import * as DesktopState from "../app/DesktopState.ts";
 import * as ElectronMenu from "../electron/ElectronMenu.ts";
 import { getDesktopUrl } from "../electron/ElectronProtocol.ts";
 import * as ElectronShell from "../electron/ElectronShell.ts";
@@ -62,6 +63,7 @@ type DesktopWindowRuntimeServices =
   | DesktopAssets.DesktopAssets
   | DesktopAppSettings.DesktopAppSettings
   | DesktopClientSettings.DesktopClientSettings
+  | DesktopState.DesktopState
   | ElectronApp.ElectronApp
   | ElectronMenu.ElectronMenu
   | ElectronShell.ElectronShell
@@ -166,7 +168,11 @@ function windowBoundsEqual(
   );
 }
 
-export function resolveInitialMainWindowBounds(
+// Saved bounds are only honored while they still land on a connected display,
+// so a window saved on a monitor that is now unplugged opens at the default
+// size instead of somewhere the user cannot reach. Shared by the main window
+// and by each restored secondary window.
+export function resolvePersistedWindowBounds(
   persistedBounds: DesktopAppSettings.DesktopWindowBounds | null,
   displays: readonly DisplayBounds[],
 ): DesktopAppSettings.DesktopWindowBounds | typeof DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE {
@@ -227,6 +233,26 @@ export function isSameOriginRendererNavigation(input: {
   } catch {
     return false;
   }
+}
+
+// The URL a restored window should load. Only the app's own origin is ever
+// loaded back: a persisted string that is not ours (hand-edited settings, an
+// origin left behind by an older build) falls back to the plain app URL rather
+// than pointing a window at somebody else's page.
+export function resolveRestoredWindowUrl(input: {
+  readonly applicationUrl: string;
+  readonly savedUrl: string | null;
+}): string {
+  if (
+    input.savedUrl !== null &&
+    isSameOriginRendererNavigation({
+      applicationUrl: input.applicationUrl,
+      navigationUrl: input.savedUrl,
+    })
+  ) {
+    return input.savedUrl;
+  }
+  return input.applicationUrl;
 }
 
 export function isRetryableDevelopmentRendererLoadFailure(input: {
@@ -311,6 +337,7 @@ export const make = Effect.gen(function* () {
   const previewManager = yield* PreviewManager.PreviewManager;
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
   const clientSettings = yield* DesktopClientSettings.DesktopClientSettings;
+  const desktopState = yield* DesktopState.DesktopState;
   const electronApp = yield* ElectronApp.ElectronApp;
   // Window-side latch for the primary backend's readiness. Set by
   // handleBackendReady (driven by the pool's onReady callback), cleared
@@ -321,10 +348,53 @@ export const make = Effect.gen(function* () {
   // The transient "Connecting to WSL" splash window, tracked separately so it
   // is never mistaken for the real main window.
   const splashWindowRef = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+  // Launch-time restore runs once. A backend restart re-fires
+  // `handleBackendReady`, and the windows are already open by then.
+  const secondaryWindowsRestoredRef = yield* Ref.make(false);
   const context = yield* Effect.context<DesktopWindowRuntimeServices>();
   const runFork = Effect.runForkWith(context);
   const runPromise = Effect.runPromiseWith(context);
   let flushMainWindowBounds: Effect.Effect<void> = Effect.void;
+
+  // Live secondary windows in the order they should reopen. Insertion order is
+  // the reopen order, so this map is the persisted list. Bounds and URL edits
+  // are debounced like the main window's bounds; opening and closing a window
+  // writes straight through, because a window the user closed must not come
+  // back even if the app quits in the next tick.
+  const secondaryWindowStates = new Map<number, DesktopAppSettings.DesktopSecondaryWindow>();
+  let nextSecondaryWindowId = 0;
+  let secondaryWindowsPersistFiber: Fiber.Fiber<void, never> | undefined;
+
+  const cancelSecondaryWindowsPersist = () => {
+    if (secondaryWindowsPersistFiber === undefined) return;
+    const fiber = secondaryWindowsPersistFiber;
+    secondaryWindowsPersistFiber = undefined;
+    runFork(Fiber.interrupt(fiber));
+  };
+  const persistSecondaryWindowsNow = () => {
+    cancelSecondaryWindowsPersist();
+    runFork(
+      desktopSettings.setSecondaryWindows([...secondaryWindowStates.values()]).pipe(
+        Effect.asVoid,
+        Effect.catch((error) =>
+          logWindowWarning("failed to persist open windows", { message: error.message }),
+        ),
+      ),
+    );
+  };
+  const scheduleSecondaryWindowsPersist = () => {
+    cancelSecondaryWindowsPersist();
+    secondaryWindowsPersistFiber = runFork(
+      Effect.sleep(MAIN_WINDOW_BOUNDS_PERSIST_DEBOUNCE_MS).pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            secondaryWindowsPersistFiber = undefined;
+            persistSecondaryWindowsNow();
+          }),
+        ),
+      ),
+    );
+  };
 
   const dismissConnectingSplash = Effect.gen(function* () {
     const splash = yield* Ref.getAndSet(splashWindowRef, Option.none());
@@ -373,11 +443,15 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const createWindow = Effect.fn("desktop.window.createWindow")(function* (
-    role: DesktopWindowRole,
-  ): Effect.fn.Return<Electron.BrowserWindow, DesktopWindowError> {
+  const createWindow = Effect.fn("desktop.window.createWindow")(function* (input: {
+    readonly role: DesktopWindowRole;
+    /** Set when this window is being reopened from the persisted set. */
+    readonly restored?: DesktopAppSettings.DesktopSecondaryWindow;
+  }): Effect.fn.Return<Electron.BrowserWindow, DesktopWindowError> {
+    const role = input.role;
     const isMainWindow = role === "main";
-    yield* Effect.annotateCurrentSpan({ role });
+    const restored = isMainWindow ? undefined : input.restored;
+    yield* Effect.annotateCurrentSpan({ role, restored: restored !== undefined });
     yield* previewManager.getBrowserSession();
     const applicationUrl = getDesktopUrl(environment.isDevelopment);
     const iconPaths = yield* assets.iconPaths;
@@ -402,8 +476,10 @@ export const make = Effect.gen(function* () {
             cause: displayBoundsResult.cause,
           }).pipe(Effect.as<readonly Electron.Rectangle[]>([]));
     const initialBounds = isMainWindow
-      ? resolveInitialMainWindowBounds(persistedBounds, displayBounds)
-      : resolveSecondaryWindowBounds(yield* focusedWindowBounds, displayBounds);
+      ? resolvePersistedWindowBounds(persistedBounds, displayBounds)
+      : restored !== undefined
+        ? resolvePersistedWindowBounds(restored.bounds, displayBounds)
+        : resolveSecondaryWindowBounds(yield* focusedWindowBounds, displayBounds);
     const restoredPersistedBounds =
       isMainWindow && persistedBounds !== null && initialBounds === persistedBounds;
     if (
@@ -532,6 +608,35 @@ export const make = Effect.gen(function* () {
     // path drains, so closing one can never overwrite the main window's bounds.
     if (isMainWindow) {
       flushMainWindowBounds = flushBoundsPersist;
+    }
+
+    // Secondary windows are the ones that come back on the next launch, so each
+    // one gets an entry in the persisted set for as long as it is open.
+    const secondaryWindowId = isMainWindow ? null : nextSecondaryWindowId++;
+    const updateSecondaryWindowState = (
+      update: (
+        current: DesktopAppSettings.DesktopSecondaryWindow,
+      ) => DesktopAppSettings.DesktopSecondaryWindow,
+    ) => {
+      if (secondaryWindowId === null) return;
+      const current = secondaryWindowStates.get(secondaryWindowId);
+      if (current === undefined) return;
+      secondaryWindowStates.set(secondaryWindowId, update(current));
+      scheduleSecondaryWindowsPersist();
+    };
+    // `initialBounds` may be a bare size (Electron centers the window), so the
+    // first record is read back off the live window rather than guessed. A
+    // window whose bounds fail the domain schema is simply not tracked — the
+    // same rule the main window's bounds already follow.
+    if (secondaryWindowId !== null) {
+      const openedBounds = readPersistableBounds() ?? restored?.bounds ?? null;
+      if (openedBounds !== null) {
+        secondaryWindowStates.set(secondaryWindowId, {
+          bounds: openedBounds,
+          url: restored?.url ?? null,
+        });
+        persistSecondaryWindowsNow();
+      }
     }
 
     // Every window hosts its own preview guests, so every window registers. The
@@ -669,6 +774,26 @@ export const make = Effect.gen(function* () {
       window.on("close", () => {
         runFork(flushBoundsPersist);
       });
+    } else {
+      const recordSecondaryBounds = () => {
+        const bounds = readPersistableBounds();
+        if (bounds === null) return;
+        updateSecondaryWindowState((current) => ({ ...current, bounds }));
+      };
+      window.on("resize", recordSecondaryBounds);
+      window.on("move", recordSecondaryBounds);
+      const recordSecondaryUrl = () => {
+        if (window.isDestroyed()) return;
+        const url = window.webContents.getURL();
+        // Off-origin URLs are never persisted, so nothing foreign can reach the
+        // settings file in the first place.
+        if (!isSameOriginRendererNavigation({ applicationUrl, navigationUrl: url })) return;
+        updateSecondaryWindowState((current) =>
+          current.url === url ? current : { ...current, url },
+        );
+      };
+      window.webContents.on("did-navigate", recordSecondaryUrl);
+      window.webContents.on("did-navigate-in-page", recordSecondaryUrl);
     }
 
     if (environment.platform === "darwin") {
@@ -691,11 +816,19 @@ export const make = Effect.gen(function* () {
       developmentLoadRetryFiber = undefined;
       runFork(Fiber.interrupt(retryFiber));
     };
+    // A restored window opens back on the route it was showing. Cleared once it
+    // loads (or once the load fails), so a renderer-crash reload and the
+    // development retry both behave exactly as they do for any other window.
+    let restoredUrl: string | null = null;
+    if (restored !== undefined) {
+      const target = resolveRestoredWindowUrl({ applicationUrl, savedUrl: restored.url });
+      restoredUrl = target === applicationUrl ? null : target;
+    }
     const loadApplication = () => {
       if (window.isDestroyed()) {
         return;
       }
-      void window.loadURL(applicationUrl).catch(() => undefined);
+      void window.loadURL(restoredUrl ?? applicationUrl).catch(() => undefined);
     };
     const scheduleDevelopmentLoadRetry = () => {
       if (developmentLoadRetryFiber !== undefined || window.isDestroyed()) {
@@ -735,6 +868,7 @@ export const make = Effect.gen(function* () {
       }
       clearDevelopmentLoadRetry();
       developmentLoadRetryIndex = 0;
+      restoredUrl = null;
       window.setTitle(environment.displayName);
     });
     window.webContents.on(
@@ -742,6 +876,13 @@ export const make = Effect.gen(function* () {
       (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
         if (!isMainFrame) {
           return;
+        }
+        // A saved route that no longer loads must not leave a blank window
+        // behind — in production there is no retry to fall back on, so drop the
+        // restored URL and open the app at its default route instead.
+        if (restoredUrl !== null) {
+          restoredUrl = null;
+          loadApplication();
         }
         const retryInMs =
           environment.isDevelopment &&
@@ -833,6 +974,18 @@ export const make = Effect.gen(function* () {
     window.on("closed", () => {
       clearDevelopmentLoadRetry();
       clearBoundsPersist();
+      if (secondaryWindowId !== null) {
+        void runPromise(
+          Effect.gen(function* () {
+            // Quitting tears every window down, and that set is exactly what
+            // should come back next launch. A close while the app keeps running
+            // is the user saying "not this window again".
+            if (yield* Ref.get(desktopState.quitting)) return;
+            if (!secondaryWindowStates.delete(secondaryWindowId)) return;
+            persistSecondaryWindowsNow();
+          }),
+        );
+      }
       void runPromise(electronWindow.clearMain(Option.some(window)));
     });
 
@@ -840,7 +993,7 @@ export const make = Effect.gen(function* () {
   });
 
   const createMain = Effect.gen(function* () {
-    const window = yield* createWindow("main");
+    const window = yield* createWindow({ role: "main" });
     yield* electronWindow.setMain(window);
     yield* logWindowInfo("main window created");
     return window;
@@ -852,9 +1005,29 @@ export const make = Effect.gen(function* () {
       yield* logWindowInfo("ignored new window request; backend is not ready");
       return;
     }
-    yield* createWindow("secondary");
+    yield* createWindow({ role: "secondary" });
     yield* logWindowInfo("secondary window created");
   }).pipe(Effect.withSpan("desktop.window.createSecondary"));
+
+  // Reopens the windows that were open when the app last quit. Runs once, after
+  // the main window exists, so the restored windows cascade off a real window
+  // and the user sees the main window first. A window that fails to open is
+  // logged and skipped: the rest still come back, and startup never fails
+  // because of it.
+  const restoreSecondaryWindows = Effect.gen(function* () {
+    if (yield* Ref.getAndSet(secondaryWindowsRestoredRef, true)) return;
+    const saved = (yield* desktopSettings.get).secondaryWindows;
+    if (saved.length === 0) return;
+    for (const window of saved) {
+      yield* createWindow({ role: "secondary", restored: window }).pipe(
+        Effect.asVoid,
+        Effect.catch((error) =>
+          logWindowWarning("failed to restore a saved window", { message: error.message }),
+        ),
+      );
+    }
+    yield* logWindowInfo("restored saved windows", { count: saved.length });
+  }).pipe(Effect.withSpan("desktop.window.restoreSecondaryWindows"));
 
   const ensureMain = Effect.gen(function* () {
     const existingWindow = yield* currentMainWindow;
@@ -956,6 +1129,7 @@ export const make = Effect.gen(function* () {
       yield* Ref.set(backendReadyRef, true);
       yield* logWindowInfo("backend ready", { source: "http", url: httpBaseUrl.href });
       yield* createMainIfBackendReady;
+      yield* restoreSecondaryWindows;
     }),
     handleBackendNotReady: Ref.set(backendReadyRef, false).pipe(
       Effect.withSpan("desktop.window.handleBackendNotReady"),
