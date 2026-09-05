@@ -1277,7 +1277,10 @@ describe("ClaudeAdapterLive", () => {
       }) as unknown as SDKMessage;
     const limitsUpdates = (events: Iterable<ProviderRuntimeEvent>) =>
       Array.from(events).flatMap((event) =>
-        event.type === "account.rate-limits.updated" ? [event.payload.limits] : [],
+        // A limit-reset-only event carries no windows; only window updates count here.
+        event.type === "account.rate-limits.updated" && event.payload.limits
+          ? [event.payload.limits]
+          : [],
       );
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
