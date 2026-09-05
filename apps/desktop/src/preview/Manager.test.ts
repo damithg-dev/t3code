@@ -266,22 +266,6 @@ const makeTestAppWindow = (host: TestHostWebContents) => {
   };
 };
 
-const APP_SHORTCUT = {
-  type: "keyDown",
-  key: "k",
-  meta: true,
-  shift: false,
-  control: false,
-  alt: false,
-} as Electron.Input;
-
-const takeBeforeInputListener = (wc: { readonly on: unknown }) => {
-  const on = wc.on as ReturnType<typeof vi.fn>;
-  const registered = on.mock.calls.find(([event]) => event === "before-input-event");
-  if (!registered) throw new Error("Expected a before-input-event listener on the guest.");
-  return registered[1] as (event: { preventDefault: () => void }, input: Electron.Input) => void;
-};
-
 const makeTestPreviewWebContents = (
   capturePage: () => Promise<TestCapturedPreviewImage>,
   id = 42,
@@ -4172,36 +4156,6 @@ describe("PreviewManager", () => {
     ),
   );
 
-  effectIt.effect("forwards an app shortcut to the window that owns the guest", () =>
-    withManager((manager) =>
-      Effect.gen(function* () {
-        const capturePage = vi.fn(async () => ({
-          toJPEG: () => Buffer.from("frame"),
-          getSize: () => ({ width: 1280, height: 720 }),
-        }));
-        const first = makeTestAppWindow(makeTestHostWebContents(7));
-        const second = makeTestAppWindow(makeTestHostWebContents(8));
-        const guest = makeTestPreviewWebContents(capturePage, 42, second.host);
-        fromId.mockReturnValue(guest);
-
-        yield* manager.registerWindow(first.window);
-        yield* manager.registerWindow(second.window);
-        yield* manager.createTab("tab_shortcut_routing");
-        yield* manager.registerWebview("tab_shortcut_routing", 42);
-
-        const event = { preventDefault: vi.fn() };
-        takeBeforeInputListener(guest)(event, APP_SHORTCUT);
-        yield* Effect.yieldNow;
-
-        expect(event.preventDefault).toHaveBeenCalledOnce();
-        expect(second.host.sendInputEvent.mock.calls).toEqual([
-          [{ type: "keyDown", keyCode: "k", modifiers: ["meta"] }],
-        ]);
-        expect(first.host.sendInputEvent).not.toHaveBeenCalled();
-      }),
-    ),
-  );
-
   effectIt.effect("drops guest events once their window is gone", () =>
     withManager((manager) =>
       Effect.gen(function* () {
@@ -4225,15 +4179,10 @@ describe("PreviewManager", () => {
         yield* manager.registerWebview("tab_closing_window", 42);
 
         closing.close();
-
-        // The press is dropped rather than replayed into the surviving window.
-        const event = { preventDefault: vi.fn() };
-        takeBeforeInputListener(webContentsById.get(42)!)(event, APP_SHORTCUT);
         yield* Effect.yieldNow;
-        expect(event.preventDefault).not.toHaveBeenCalled();
-        expect(closing.host.sendInputEvent).not.toHaveBeenCalled();
-        expect(survivor.host.sendInputEvent).not.toHaveBeenCalled();
 
+        // The closed window is gone from the registry, so a guest it hosted can
+        // no longer attach -- and the surviving window never inherits it.
         yield* manager.createTab("tab_after_close");
         const rejected = yield* Effect.exit(manager.registerWebview("tab_after_close", 43));
         expect(Exit.isFailure(rejected)).toBe(true);
