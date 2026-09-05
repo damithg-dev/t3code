@@ -145,9 +145,15 @@ already dispatch.
 The desktop shell can hold several app windows at once. `DesktopWindow.createWindow` takes a role:
 the **main** window (window 1) owns the singular state — the persisted `mainWindowBounds` record,
 the module-level bounds flush, the `ElectronWindow` main registration, and the connecting splash —
-while a **secondary** window reuses the rest of the per-window setup and persists nothing. Only
-`createSecondary`, driven by File → New Window, makes one; `activate` and `ensureMain` are
-unchanged, so nothing creates a window implicitly.
+while a **secondary** window reuses the rest of the per-window setup. `createSecondary`, driven by
+Window → New Window, makes one; `activate` and `ensureMain` are unchanged, so nothing creates a
+window implicitly.
+
+Secondary windows are tracked in the `secondaryWindows` desktop setting: bounds plus the renderer
+URL, appended on open and dropped on close unless `DesktopState.quitting` is set, so an app quit
+preserves the set while a deliberate close does not. `handleBackendReady` replays it once, after
+the main window exists. Saved bounds go through the same display fit-check the main window uses,
+and a saved URL is only loaded back when `isSameOriginRendererNavigation` accepts it.
 
 `PreviewManager` keeps a registry of windows keyed by each window's own `webContents.id`, which is
 what a preview guest's `hostWebContents` resolves to. Guest attachment accepts any registered
