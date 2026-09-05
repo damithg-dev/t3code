@@ -66,6 +66,7 @@ import Migration0050 from "./Migrations/050_ProjectionCheckpointRefs.ts";
 import Migration0051 from "./Migrations/051_ProjectionThreadsWorktrees.ts";
 import Migration0052 from "./Migrations/052_HealSkippedRenumberedMigrations.ts";
 import Migration0053 from "./Migrations/053_ProjectionThreadSessionsRateLimitResetsAt.ts";
+import Migration0054 from "./Migrations/054_ProjectionThreadsQueuedTurn.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -141,6 +142,7 @@ export const migrationEntries = [
   [51, "ProjectionThreadsWorktrees", Migration0051],
   [52, "HealSkippedRenumberedMigrations", Migration0052],
   [53, "ProjectionThreadSessionsRateLimitResetsAt", Migration0053],
+  [54, "ProjectionThreadsQueuedTurn", Migration0054],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

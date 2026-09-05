@@ -30,6 +30,8 @@ import {
   ThreadUnpinnedPayload,
   ThreadUnarchivedPayload,
   ThreadUnsettledPayload,
+  ThreadTurnDequeuedPayload,
+  ThreadTurnQueuedPayload,
   ThreadUnsnoozedPayload,
   ThreadRevertedPayload,
   ThreadSessionSetPayload,
@@ -455,6 +457,28 @@ export function projectEvent(
           threads: updateThread(nextBase.threads, payload.threadId, {
             snoozedUntil: null,
             snoozedAt: null,
+            updatedAt: payload.updatedAt,
+          }),
+        })),
+      );
+
+    case "thread.turn-queued":
+      return decodeForEvent(ThreadTurnQueuedPayload, event.payload, event.type, "payload").pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            queuedTurn: payload.queuedTurn,
+            updatedAt: payload.updatedAt,
+          }),
+        })),
+      );
+
+    case "thread.turn-dequeued":
+      return decodeForEvent(ThreadTurnDequeuedPayload, event.payload, event.type, "payload").pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            queuedTurn: null,
             updatedAt: payload.updatedAt,
           }),
         })),

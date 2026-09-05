@@ -1,6 +1,7 @@
 import {
   EventId,
   MessageId,
+  QUEUED_TURN_MAX_ATTEMPTS,
   UserInputRequestedPayload,
   type OrchestrationCommand,
   type OrchestrationEvent,
@@ -33,6 +34,7 @@ import {
   requireThreadNotArchived,
 } from "./commandInvariants.ts";
 import { projectEvent } from "./projector.ts";
+import { QUEUED_TURN_WATCH_WINDOW_MINUTES } from "./QueuedTurnPolicy.ts";
 import { threadHasQueuedTurnStart } from "./ThreadSettlementPolicy.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -395,13 +397,13 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.archive": {
-      yield* requireThreadNotArchived({
+      const thread = yield* requireThreadNotArchived({
         readModel,
         command,
         threadId: command.threadId,
       });
       const occurredAt = yield* nowIso;
-      return {
+      const archivedEvent: Omit<OrchestrationEvent, "sequence"> = {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
@@ -415,6 +417,24 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           updatedAt: occurredAt,
         },
       };
+      // Archiving takes the thread out of every active read, including the
+      // sweeper's. A queued turn left behind would be invisible until an
+      // unarchive dropped a stale message into a live thread, so the archive
+      // itself drops it — the way out of the queue, not a silent loss.
+      if (thread.queuedTurn == null) return archivedEvent;
+      return [
+        archivedEvent,
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.turn-dequeued",
+          payload: { threadId: command.threadId, reason: "orphaned", updatedAt: occurredAt },
+        },
+      ];
     }
 
     case "thread.unarchive": {
@@ -1024,6 +1044,309 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         });
       }
       return [...lifecycleResetEvents, userMessageEvent, turnStartRequestedEvent];
+    }
+
+    case "thread.turn.queue": {
+      const thread = yield* requireThreadNotArchived({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      const occurredAt = yield* nowIso;
+      // Queueing to a moment that has already passed would park a turn the
+      // sweeper sends on its very next pass, which is not what "queue until
+      // limits reset" promises. The negated comparison also rejects an
+      // unparseable time (IsoDateTime is structurally just a string).
+      if (!(Date.parse(command.dispatchAfter) > Date.parse(occurredAt))) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} queue dispatch time ${command.dispatchAfter} is not in the future`,
+          }),
+        );
+      }
+      // Replace rather than reject: one composer draft, one queued turn, and
+      // the newer text is the user's current intent. Attempts reset with it —
+      // this is a fresh decision, not a continuation of the old one.
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.turn-queued",
+        payload: {
+          threadId: command.threadId,
+          queuedTurn: {
+            messageId: command.message.messageId,
+            text: command.message.text,
+            ...(command.modelSelection !== undefined
+              ? { modelSelection: command.modelSelection }
+              : {}),
+            runtimeMode: command.runtimeMode,
+            interactionMode: command.interactionMode,
+            state: "queued",
+            readyAt: command.dispatchAfter,
+            attempts: 0,
+            queuedAt: thread.queuedTurn?.queuedAt ?? occurredAt,
+            updatedAt: occurredAt,
+          },
+          updatedAt: occurredAt,
+        },
+      };
+    }
+
+    case "thread.turn.dequeue": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      // Idempotent by re-emission (see thread.unsnooze): cancelling twice, or
+      // cancelling just as the server dispatched, lands on the same empty
+      // state. The engine rejects zero-event commands, so it cannot no-op.
+      if (thread.queuedTurn == null) {
+        return {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.turn-dequeued",
+          payload: {
+            threadId: command.threadId,
+            reason: "cancelled",
+            updatedAt: thread.updatedAt,
+          },
+        };
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.turn-dequeued",
+        payload: {
+          threadId: command.threadId,
+          reason: "cancelled",
+          updatedAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.queued-turn.dispatch": {
+      const thread = yield* requireThreadNotArchived({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      const queuedTurn = thread.queuedTurn;
+      if (queuedTurn == null) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} has no queued turn to dispatch`,
+          }),
+        );
+      }
+      // The sweeper reads a snapshot; by the time this lands the turn may
+      // already have been dispatched or stalled. Rejecting rather than
+      // re-sending is what makes "dispatched exactly once" true.
+      if (queuedTurn.state !== "queued") {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} queued turn is '${queuedTurn.state}', not waiting to be dispatched`,
+          }),
+        );
+      }
+      const now = yield* DateTime.now;
+      const occurredAt = DateTime.formatIso(now);
+      if (Date.parse(queuedTurn.readyAt) > Date.parse(occurredAt)) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} queued turn is not due until ${queuedTurn.readyAt}`,
+          }),
+        );
+      }
+      // Same shape a composer send produces, so everything downstream — the
+      // provider reactor, checkpointing, receipts — treats it as an ordinary
+      // turn. The message keeps its queued id, so a retry replays the same
+      // user message instead of stuttering a second copy onto the thread.
+      const userMessageEvent: Omit<OrchestrationEvent, "sequence"> = {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.message-sent",
+        payload: {
+          threadId: command.threadId,
+          messageId: queuedTurn.messageId,
+          role: "user",
+          text: queuedTurn.text,
+          attachments: [],
+          turnId: null,
+          streaming: false,
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+        },
+      };
+      const turnStartRequestedEvent: Omit<OrchestrationEvent, "sequence"> = {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          commandId: command.commandId,
+        })),
+        causationEventId: userMessageEvent.eventId,
+        type: "thread.turn-start-requested",
+        payload: {
+          threadId: command.threadId,
+          messageId: queuedTurn.messageId,
+          ...(queuedTurn.modelSelection !== undefined
+            ? { modelSelection: queuedTurn.modelSelection }
+            : {}),
+          runtimeMode: queuedTurn.runtimeMode,
+          interactionMode: queuedTurn.interactionMode,
+          createdAt: occurredAt,
+        },
+      };
+      // A queued send is the user re-engaging just as much as a live one, so
+      // it spends the same lifecycle overrides thread.turn.start spends.
+      const lifecycleResetEvents: Array<Omit<OrchestrationEvent, "sequence">> = [];
+      if (thread.settledOverride !== null) {
+        lifecycleResetEvents.push({
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.unsettled",
+          payload: { threadId: command.threadId, reason: "activity", updatedAt: occurredAt },
+        });
+      }
+      if (thread.snoozedUntil != null) {
+        lifecycleResetEvents.push({
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.unsnoozed",
+          payload: { threadId: command.threadId, reason: "activity", updatedAt: occurredAt },
+        });
+      }
+      const watchedUntil = DateTime.formatIso(
+        DateTime.add(now, { minutes: QUEUED_TURN_WATCH_WINDOW_MINUTES }),
+      );
+      const queuedTurnEvent: Omit<OrchestrationEvent, "sequence"> = {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.turn-queued",
+        payload: {
+          threadId: command.threadId,
+          queuedTurn: {
+            ...queuedTurn,
+            state: "awaiting",
+            readyAt: watchedUntil,
+            attempts: queuedTurn.attempts + 1,
+            updatedAt: occurredAt,
+          },
+          updatedAt: occurredAt,
+        },
+      };
+      return [...lifecycleResetEvents, userMessageEvent, turnStartRequestedEvent, queuedTurnEvent];
+    }
+
+    case "thread.queued-turn.reschedule": {
+      const thread = yield* requireThreadNotArchived({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      const queuedTurn = thread.queuedTurn;
+      if (queuedTurn == null || queuedTurn.state !== "awaiting") {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} has no dispatched queued turn to reschedule`,
+          }),
+        );
+      }
+      // The cap lives here, not only in the sweeper: it is the invariant that
+      // makes "never loops" true no matter who issues the command.
+      if (command.dispatchAfter !== null && queuedTurn.attempts >= QUEUED_TURN_MAX_ATTEMPTS) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} queued turn has spent its ${QUEUED_TURN_MAX_ATTEMPTS} attempts and cannot be retried again`,
+          }),
+        );
+      }
+      const occurredAt = yield* nowIso;
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.turn-queued",
+        payload: {
+          threadId: command.threadId,
+          queuedTurn: {
+            ...queuedTurn,
+            ...(command.dispatchAfter === null
+              ? { state: "stalled" as const }
+              : { state: "queued" as const, readyAt: command.dispatchAfter }),
+            updatedAt: occurredAt,
+          },
+          updatedAt: occurredAt,
+        },
+      };
+    }
+
+    case "thread.queued-turn.release": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      if (thread.queuedTurn == null) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} has no queued turn to release`,
+          }),
+        );
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.turn-dequeued",
+        payload: {
+          threadId: command.threadId,
+          reason: command.reason,
+          updatedAt: command.createdAt,
+        },
+      };
     }
 
     case "thread.turn.interrupt": {

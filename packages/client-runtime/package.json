@@ -183,6 +183,10 @@
       "types": "./src/state/threadSort.ts",
       "default": "./src/state/threadSort.ts"
     },
+    "./state/thread-queued-turn": {
+      "types": "./src/state/threadQueuedTurn.ts",
+      "default": "./src/state/threadQueuedTurn.ts"
+    },
     "./state/thread-settled": {
       "types": "./src/state/threadSettled.ts",
       "default": "./src/state/threadSettled.ts"
