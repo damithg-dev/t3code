@@ -809,6 +809,52 @@ describe("ProviderCommandReactor", () => {
     expect(attempts).toBe(2);
   });
 
+  it("titles a thread from an issue key without asking a model", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    // The client names a new thread after the message it is about to send and
+    // passes that same string as the seed; the server replaces it with the
+    // shorter key-derived title.
+    const seededTitle = "Bab-24123 fix the login timing regression on cold start";
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-title-issue-key-seed"),
+        threadId: ThreadId.make("thread-1"),
+        title: seededTitle,
+      }),
+    );
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-issue-key-title"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-issue-key"),
+          role: "user",
+          text: seededTitle,
+          attachments: [],
+        },
+        titleSeed: seededTitle,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(async () => {
+      const readModel = await harness.readModel();
+      return (
+        readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"))?.title ===
+        "Bab-24123 fix the login timing regression on cold"
+      );
+    });
+    // The model is never asked: the message already named the work.
+    expect(harness.generateThreadTitle.mock.calls.length).toBe(0);
+  });
+
   it("regenerates a thread title from the current conversation", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

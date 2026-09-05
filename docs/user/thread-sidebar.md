@@ -43,6 +43,11 @@ the send button. Choose **Artwork**, **Version pill**, or **None** in Settings u
 identification. Artwork is recolored to match each built-in theme. Custom themes use the **Version
 pill** fallback because their colors are not controlled by T3 Code.
 
+Threads are normally titled from your first message. When that message names an issue —
+`Bab-24123`, `ABC-123`, or a link to the issue on Favro, Linear or Jira — T3 Code titles the thread
+with the key and a few words from the message instead of writing one for you, so the thread reads
+the same as the ticket you are working from.
+
 To generate a fresh title from the conversation, open a thread's context menu and choose
 **Regenerate title**. While T3 Code is generating it, the action reads **Regenerating…** and cannot
 be selected again. The option is hidden when the connected environment needs a server update.
