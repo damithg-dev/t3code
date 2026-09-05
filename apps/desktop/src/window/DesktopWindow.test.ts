@@ -196,6 +196,15 @@ const desktopWindowBoundsEquivalence = Schema.toEquivalence(
   DesktopAppSettings.DesktopWindowBoundsSchema,
 );
 
+function makeDesktopStateLayer(quitting?: Ref.Ref<boolean>) {
+  return quitting === undefined
+    ? DesktopState.layer
+    : Layer.effect(
+        DesktopState.DesktopState,
+        Effect.map(Ref.make(false), (backendReady) => ({ backendReady, quitting })),
+      );
+}
+
 function makeTestLayer(input: {
   readonly window: Electron.BrowserWindow;
   /** Returned by `create` after the first window, in order. */
@@ -206,11 +215,15 @@ function makeTestLayer(input: {
   readonly desktopSettings?: DesktopAppSettings.DesktopSettings;
   readonly mainWindowBoundsUpdates?: DesktopAppSettings.DesktopWindowBounds[];
   readonly mainWindowMaximizedUpdates?: boolean[];
+  /** Every value written to the reopen-on-launch set, in order. */
+  readonly secondaryWindowUpdates?: (readonly DesktopAppSettings.DesktopSecondaryWindow[])[];
   readonly beforeMainWindowBoundsUpdate?: (
     bounds: DesktopAppSettings.DesktopWindowBounds,
   ) => Effect.Effect<void>;
   readonly openedExternalUrls?: unknown[];
   readonly previewZoomReapplies?: number[];
+  /** Flipped by tests that need to tell an app quit from a user closing a window. */
+  readonly quittingRef?: Ref.Ref<boolean>;
 }) {
   let desktopSettings = input.desktopSettings ?? DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS;
   const desktopAppSettingsLayer = Layer.succeed(DesktopAppSettings.DesktopAppSettings, {
@@ -233,6 +246,25 @@ function makeTestLayer(input: {
           };
           input.mainWindowBoundsUpdates?.push(bounds);
           input.mainWindowMaximizedUpdates?.push(isMaximized);
+        }
+        return { settings: desktopSettings, changed };
+      }),
+    setSecondaryWindows: (windows) =>
+      Effect.sync(() => {
+        const current = desktopSettings.secondaryWindows;
+        const changed =
+          current.length !== windows.length ||
+          windows.some((window, index) => {
+            const previous = current[index];
+            return (
+              previous === undefined ||
+              previous.url !== window.url ||
+              !desktopWindowBoundsEquivalence(previous.bounds, window.bounds)
+            );
+          });
+        if (changed) {
+          desktopSettings = { ...desktopSettings, secondaryWindows: windows };
+          input.secondaryWindowUpdates?.push(windows);
         }
         return { settings: desktopSettings, changed };
       }),
@@ -272,7 +304,7 @@ function makeTestLayer(input: {
         desktopAppSettingsLayer,
         desktopClientSettingsLayer,
         desktopServerExposureLayer,
-        DesktopState.layer,
+        makeDesktopStateLayer(input.quittingRef),
         electronAppLayer,
         electronMenuLayer,
         Layer.succeed(ElectronShell.ElectronShell, {
@@ -378,6 +410,7 @@ const makeSplashScenario = (createOutcomes: readonly (Electron.BrowserWindow | n
           DesktopAppSettings.layerTest(),
           desktopClientSettingsLayer,
           desktopServerExposureLayer,
+          DesktopState.layer,
           electronAppLayer,
           electronMenuLayer,
           Layer.succeed(ElectronShell.ElectronShell, {
@@ -428,11 +461,11 @@ describe("DesktopWindow", () => {
     ];
 
     assert.deepEqual(
-      DesktopWindow.resolveInitialMainWindowBounds(persistedBounds, displays),
+      DesktopWindow.resolvePersistedWindowBounds(persistedBounds, displays),
       persistedBounds,
     );
     assert.deepEqual(
-      DesktopWindow.resolveInitialMainWindowBounds(persistedBounds, [displays[0]!]),
+      DesktopWindow.resolvePersistedWindowBounds(persistedBounds, [displays[0]!]),
       DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
     );
   });
@@ -494,10 +527,13 @@ describe("DesktopWindow", () => {
         assert.equal(createdWindowOptions[1]?.y, 124);
         // Window 1 stays "main": a secondary never re-registers itself.
         assert.deepEqual(yield* Ref.get(mainWindow), Option.some(mainFake.window));
-        // No bounds listeners means a secondary can neither schedule nor flush a
-        // write to the single persisted bounds record.
-        assert.isUndefined(secondaryFake.windowListeners.get("resize"));
-        assert.isUndefined(secondaryFake.windowListeners.get("move"));
+        // A secondary tracks its own bounds for the reopen set, but it never
+        // touches the single persisted main-window record and never joins the
+        // close-time flush the quit path drains.
+        secondaryFake.windowListeners.get("resize")?.();
+        yield* TestClock.adjust(500);
+        yield* Effect.promise(() => Promise.resolve());
+        assert.deepEqual(mainWindowBoundsUpdates, []);
         assert.isUndefined(secondaryFake.windowListeners.get("close"));
 
         yield* desktopWindow.flushMainWindowBounds;
@@ -505,6 +541,207 @@ describe("DesktopWindow", () => {
       }).pipe(Effect.provide(layer));
     }),
   );
+
+  it.effect("drops a window the user closed from the set that reopens on launch", () =>
+    Effect.gen(function* () {
+      const mainFake = makeFakeBrowserWindow();
+      const secondaryFake = makeFakeBrowserWindow();
+      secondaryFake.getBounds.mockReturnValue({ x: 124, y: 124, width: 1200, height: 800 });
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const secondaryWindowUpdates: (readonly DesktopAppSettings.DesktopSecondaryWindow[])[] = [];
+      const quittingRef = yield* Ref.make(false);
+      const layer = makeTestLayer({
+        window: mainFake.window,
+        additionalWindows: [secondaryFake.window],
+        createCount,
+        mainWindow,
+        secondaryWindowUpdates,
+        quittingRef,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        yield* desktopWindow.createSecondary;
+        yield* Effect.promise(() => Promise.resolve());
+
+        // Opening records where the window sits and what it is showing.
+        assert.deepEqual(secondaryWindowUpdates, [
+          [{ bounds: { x: 124, y: 124, width: 1200, height: 800 }, url: null }],
+        ]);
+
+        // Navigating updates the recorded route, debounced like the main
+        // window's bounds.
+        secondaryFake.webContentsListeners.get("did-navigate-in-page")?.();
+        yield* TestClock.adjust(500);
+        yield* Effect.promise(() => Promise.resolve());
+        assert.deepEqual(secondaryWindowUpdates[1], [
+          { bounds: { x: 124, y: 124, width: 1200, height: 800 }, url: "t3code-dev://app/" },
+        ]);
+
+        // Closing it while the app keeps running means "not this one again".
+        secondaryFake.windowListeners.get("closed")?.();
+        yield* Effect.promise(() => Promise.resolve());
+        assert.deepEqual(secondaryWindowUpdates.at(-1), []);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("keeps the set that reopens on launch when the app is quitting", () =>
+    Effect.gen(function* () {
+      const mainFake = makeFakeBrowserWindow();
+      const secondaryFake = makeFakeBrowserWindow();
+      secondaryFake.getBounds.mockReturnValue({ x: 124, y: 124, width: 1200, height: 800 });
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const secondaryWindowUpdates: (readonly DesktopAppSettings.DesktopSecondaryWindow[])[] = [];
+      const quittingRef = yield* Ref.make(false);
+      const layer = makeTestLayer({
+        window: mainFake.window,
+        additionalWindows: [secondaryFake.window],
+        createCount,
+        mainWindow,
+        secondaryWindowUpdates,
+        quittingRef,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        yield* desktopWindow.createSecondary;
+        yield* Effect.promise(() => Promise.resolve());
+        assert.equal(secondaryWindowUpdates.length, 1);
+
+        // Quit tears every window down, and that set is exactly what should come
+        // back next launch.
+        yield* Ref.set(quittingRef, true);
+        secondaryFake.windowListeners.get("closed")?.();
+        yield* Effect.promise(() => Promise.resolve());
+        assert.equal(secondaryWindowUpdates.length, 1);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("reopens saved windows on launch, off-display ones at the default size", () =>
+    Effect.gen(function* () {
+      const mainFake = makeFakeBrowserWindow();
+      const restoredFake = makeFakeBrowserWindow();
+      const offDisplayFake = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const createdWindowOptions: Electron.BrowserWindowConstructorOptions[] = [];
+      const layer = makeTestLayer({
+        window: mainFake.window,
+        additionalWindows: [restoredFake.window, offDisplayFake.window],
+        createCount,
+        mainWindow,
+        createdWindowOptions,
+        desktopSettings: {
+          ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
+          secondaryWindows: [
+            {
+              bounds: { x: 120, y: 80, width: 1280, height: 900 },
+              url: "t3code-dev://app/#/projects/one",
+            },
+            // Saved on a monitor that is no longer connected.
+            { bounds: { x: 4000, y: 0, width: 1200, height: 800 }, url: "https://evil.example/" },
+          ],
+        },
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+
+        assert.equal(yield* Ref.get(createCount), 3);
+        assert.equal(createdWindowOptions[1]?.x, 120);
+        assert.equal(createdWindowOptions[1]?.y, 80);
+        assert.equal(createdWindowOptions[1]?.width, 1280);
+        // Unreachable bounds fall back to the default size rather than opening
+        // the window somewhere the user cannot get to it.
+        assert.isUndefined(createdWindowOptions[2]?.x);
+        assert.equal(createdWindowOptions[2]?.width, 1100);
+        assert.equal(createdWindowOptions[2]?.height, 780);
+
+        // The saved route comes back; a URL that is not ours never gets loaded.
+        assert.deepEqual(restoredFake.loadURL.mock.calls, [["t3code-dev://app/#/projects/one"]]);
+        assert.deepEqual(offDisplayFake.loadURL.mock.calls, [["t3code-dev://app/"]]);
+
+        // A second readiness report (backend restart) must not double the windows.
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        assert.equal(yield* Ref.get(createCount), 3);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("opens the app's default route when a saved one fails to load", () =>
+    Effect.gen(function* () {
+      const mainFake = makeFakeBrowserWindow();
+      const restoredFake = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({
+        window: mainFake.window,
+        additionalWindows: [restoredFake.window],
+        createCount,
+        mainWindow,
+        desktopSettings: {
+          ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
+          secondaryWindows: [
+            {
+              bounds: { x: 120, y: 80, width: 1280, height: 900 },
+              url: "t3code-dev://app/#/projects/gone",
+            },
+          ],
+        },
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+
+        const didFailLoad = restoredFake.webContentsListeners.get("did-fail-load");
+        if (!didFailLoad) {
+          return yield* Effect.die("renderer load listeners were not registered");
+        }
+        didFailLoad({}, -6, "ERR_FILE_NOT_FOUND", "t3code-dev://app/#/projects/gone", true);
+
+        assert.deepEqual(restoredFake.loadURL.mock.calls, [
+          ["t3code-dev://app/#/projects/gone"],
+          ["t3code-dev://app/"],
+        ]);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it("loads a saved route back only when it is the app's own origin", () => {
+    assert.equal(
+      DesktopWindow.resolveRestoredWindowUrl({
+        applicationUrl: "t3code://app/",
+        savedUrl: "t3code://app/#/projects/one",
+      }),
+      "t3code://app/#/projects/one",
+    );
+    assert.equal(
+      DesktopWindow.resolveRestoredWindowUrl({
+        applicationUrl: "t3code://app/",
+        savedUrl: "https://evil.example/steal",
+      }),
+      "t3code://app/",
+    );
+    assert.equal(
+      DesktopWindow.resolveRestoredWindowUrl({
+        applicationUrl: "t3code://app/",
+        savedUrl: "not a url",
+      }),
+      "t3code://app/",
+    );
+    assert.equal(
+      DesktopWindow.resolveRestoredWindowUrl({ applicationUrl: "t3code://app/", savedUrl: null }),
+      "t3code://app/",
+    );
+  });
 
   it.effect("ignores a new window request made before the backend is ready", () =>
     Effect.gen(function* () {
