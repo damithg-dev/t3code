@@ -20,6 +20,13 @@ on Windows and Linux to start a new thread and immediately open another draft. T
 next draft keeps the workspace mode and base branch you selected. With **New
 worktree**, each background submission creates its own worktree.
 
+## Thread titles
+
+Threads are normally titled from your first message. When that message names an issue —
+`Bab-24123`, `ABC-123`, or a link to the issue on Favro, Linear or Jira — T3 Code titles the thread
+with the key and a few words from the message instead of writing one for you, so the thread reads
+the same as the ticket you are working from.
+
 ## Pin and reorder threads
 
 Pin a thread from its menu to keep it above your active work. Drag pinned threads
