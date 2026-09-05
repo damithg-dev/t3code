@@ -1,6 +1,6 @@
 # Multiple windows
 
-The desktop app can show more than one window at a time. Choose **File → New Window**
+The desktop app can show more than one window at a time. Choose **Window → New Window**
 (<kbd>Cmd</kbd>/<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>N</kbd>) and a second, complete T3 Code
 window opens next to the first, offset slightly so you can see both. That shortcut belongs to the
 application menu rather than the keybindings you can edit in Settings.
