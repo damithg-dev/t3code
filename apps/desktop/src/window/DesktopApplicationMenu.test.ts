@@ -148,7 +148,7 @@ describe("DesktopApplicationMenu", () => {
     }),
   );
 
-  it.effect("opens an additional window from File → New Window", () =>
+  it.effect("opens an additional window from Window → New Window", () =>
     Effect.gen(function* () {
       const selectedAction = yield* Deferred.make<string>();
       const applicationMenuTemplate =
@@ -162,7 +162,22 @@ describe("DesktopApplicationMenu", () => {
       if (!Array.isArray(fileMenu.submenu)) {
         throw new Error("Expected File menu submenu to be an array.");
       }
-      const newWindowItem = fileMenu.submenu.find((item) => item.label === "New Window");
+      // The item lives in the Window menu now, and only there.
+      assert.isUndefined(fileMenu.submenu.find((item) => item.label === "New Window"));
+
+      const windowMenu = template.find((item) => item.role === "windowMenu");
+      assert.isDefined(windowMenu);
+      if (!Array.isArray(windowMenu.submenu)) {
+        throw new Error("Expected Window menu submenu to be an array.");
+      }
+      // The role stays `windowMenu` so macOS still appends the list of open
+      // windows below our items, and the stock ones are still there (this
+      // template is built for Linux).
+      assert.deepEqual(
+        windowMenu.submenu.map((item) => item.role ?? item.type ?? item.label),
+        ["New Window", "separator", "minimize", "zoom", "close"],
+      );
+      const newWindowItem = windowMenu.submenu.find((item) => item.label === "New Window");
       assert.isDefined(newWindowItem);
       assert.equal(newWindowItem.accelerator, "CmdOrCtrl+Shift+N");
       if (typeof newWindowItem.click !== "function") {

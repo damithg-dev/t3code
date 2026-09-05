@@ -164,6 +164,7 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
           get: Effect.sync(() => testSettings),
           load: Effect.sync(() => testSettings),
           setMainWindowBounds: () => Effect.die("unexpected main window bounds update"),
+          setSecondaryWindows: () => Effect.die("unexpected window set update"),
           setServerExposureMode: () => Effect.die("unexpected server exposure update"),
           setTailscaleServe: () => Effect.die("unexpected Tailscale Serve update"),
           setUpdateChannel: (channel) =>
