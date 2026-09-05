@@ -583,13 +583,23 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const parentScope = yield* Scope.Scope;
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
+  // Only ever used for the window registry, whose updates are pure Ref writes.
+  // Electron's `closed` listener has to observe the removal synchronously:
+  // anything forked would leave a window that is already gone still looking
+  // open to the next frame-capture start.
+  const runSync = Effect.runSyncWith(context);
   const resolvedArtifactDirectory = path.resolve(artifactDirectory);
   const playwrightInstallExpression = yield* Effect.cached(
     playwrightInjectedRuntimeInstallExpression(),
   );
 
   const annotationThemeRef = yield* Ref.make(DEFAULT_ANNOTATION_THEME);
-  const mainWindowRef = yield* Ref.make<Option.Option<BrowserWindow>>(Option.none());
+  // Every app window that may host preview guests, keyed by the id of its own
+  // webContents so a guest's `hostWebContents` resolves straight to its owner.
+  // An event whose host is not in here belongs to a window we do not manage (or
+  // one that has already closed) and is dropped -- routing it to another window
+  // would type into the wrong project.
+  const windowsRef = yield* Ref.make<ReadonlyMap<number, BrowserWindow>>(new Map());
   const tabsRef = yield* SynchronizedRef.make<ReadonlyMap<string, PreviewTabState>>(new Map());
   const attachedRef = yield* Ref.make<ReadonlyMap<number, ManagedListeners>>(new Map());
   const listenersRef = yield* Ref.make<ReadonlySet<Listener>>(new Set());
@@ -626,8 +636,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   let pendingRecording: PendingRecording | null = null;
   const displayMediaHandlerSessions = new WeakSet<Session>();
   let frameCaptureWindowOpen = true;
-  let currentMainWindow: BrowserWindow | undefined;
-  let mainWindowCleanupFiber: Fiber.Fiber<void, never> | undefined;
+  let windowCleanupFiber: Fiber.Fiber<void, never> | undefined;
   const tabLifecycleLocks = new Map<
     string,
     { readonly semaphore: Semaphore.Semaphore; users: number }
@@ -730,10 +739,29 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       window.webContents.setBackgroundThrottling(enabled),
     );
   });
+  const liveWindows = Effect.map(Ref.get(windowsRef), (windows) =>
+    [...windows.values()].filter((window) => !window.isDestroyed()),
+  );
+  // The registered window a guest is embedded in, or none when its host is
+  // unknown, already destroyed, or has been replaced by a newer window under the
+  // same webContents id.
+  const findHostWindow = (guest: Electron.WebContents) =>
+    Effect.map(Ref.get(windowsRef), (windows) => {
+      const host = guest.hostWebContents;
+      if (!host) return Option.none<BrowserWindow>();
+      const window = windows.get(host.id);
+      if (!window || window.isDestroyed() || window.webContents !== host) {
+        return Option.none<BrowserWindow>();
+      }
+      return Option.some(window);
+    });
+  // Frame-capture sessions are accounted across the whole app, not per window,
+  // so the throttling toggle fans out over every registered window rather than
+  // trying to attribute a session to one of them.
   const setFrameCaptureBackgroundThrottling = Effect.fnUntraced(function* (enabled: boolean) {
-    const mainWindow = yield* Ref.get(mainWindowRef);
-    if (Option.isNone(mainWindow)) return;
-    yield* setWindowBackgroundThrottling(mainWindow.value, enabled);
+    for (const window of yield* liveWindows) {
+      yield* setWindowBackgroundThrottling(window, enabled);
+    }
   });
   const setFrameCaptureWebContentsBackgroundThrottling = Effect.fnUntraced(function* (
     wc: Electron.WebContents,
@@ -1913,36 +1941,64 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     yield* install().pipe(Effect.onError(() => Scope.close(scope, Exit.void).pipe(Effect.ignore)));
   });
 
-  const setMainWindow = Effect.fn("PreviewManager.setMainWindow")(function* (
+  // Drops a window from the registry, synchronously, so a `closed` event is
+  // reflected before anything else can run. A window that is not the current
+  // holder of its id was already replaced and is ignored. Preview work is torn
+  // down only once the last window is gone: doing it per window would kill the
+  // recordings and picture-in-picture of the windows that are still open.
+  const unregisterWindowUnsafe = (window: BrowserWindow): void => {
+    const removed = runSync(
+      Ref.modify(windowsRef, (windows) => {
+        const key = window.webContents.id;
+        if (windows.get(key) !== window) return [false, windows] as const;
+        return [
+          true,
+          replaceMap(windows, (copy) => {
+            copy.delete(key);
+          }),
+        ] as const;
+      }),
+    );
+    if (!removed || runSync(Ref.get(windowsRef)).size > 0) return;
+    frameCaptureWindowOpen = false;
+    windowCleanupFiber = runFork(
+      Effect.all([closeAllPictureInPicture(), stopAllRecordings()], {
+        concurrency: "unbounded",
+        discard: true,
+      }).pipe(Effect.ignore),
+    );
+  };
+
+  const registerWindow = Effect.fn("PreviewManager.registerWindow")(function* (
     window: BrowserWindow,
   ) {
-    if (mainWindowCleanupFiber) {
-      yield* Fiber.join(mainWindowCleanupFiber);
-      mainWindowCleanupFiber = undefined;
+    if (windowCleanupFiber) {
+      yield* Fiber.join(windowCleanupFiber);
+      windowCleanupFiber = undefined;
     }
     yield* SynchronizedRef.modifyEffect(frameCaptureSessionsRef, (sessions) =>
       Effect.gen(function* () {
         if (sessions.size > 0) {
           yield* setWindowBackgroundThrottling(window, false);
         }
-        yield* Ref.set(mainWindowRef, Option.some(window));
-        currentMainWindow = window;
+        yield* Ref.update(windowsRef, (windows) =>
+          replaceMap(windows, (copy) => {
+            copy.set(window.webContents.id, window);
+          }),
+        );
         frameCaptureWindowOpen = true;
         window.once("closed", () => {
-          if (currentMainWindow !== window) return;
-          currentMainWindow = undefined;
-          frameCaptureWindowOpen = false;
-          mainWindowCleanupFiber = runFork(
-            Effect.all([closeAllPictureInPicture(), stopAllRecordings()], {
-              concurrency: "unbounded",
-              discard: true,
-            }).pipe(Effect.ignore),
-          );
+          unregisterWindowUnsafe(window);
         });
         return [undefined, sessions] as const;
       }),
     ).pipe(Effect.uninterruptible);
   });
+
+  const unregisterWindow = (window: BrowserWindow) =>
+    Effect.sync(() => {
+      unregisterWindowUnsafe(window);
+    });
 
   const createTabUnlocked = Effect.fn("PreviewManager.createTabUnlocked")(function* (
     tabId: string,
@@ -2077,13 +2133,14 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       return yield* new PreviewTabNotFoundError({ tabId });
     }
     const wc = webContents.fromId(webContentsId);
-    const mainWindow = yield* Ref.get(mainWindowRef);
-    if (
-      !wc ||
-      wc.isDestroyed() ||
-      wc.getType() !== "webview" ||
-      (Option.isSome(mainWindow) && wc.hostWebContents !== mainWindow.value.webContents)
-    ) {
+    const registeredWindows = yield* Ref.get(windowsRef);
+    if (!wc || wc.isDestroyed() || wc.getType() !== "webview") {
+      return yield* new PreviewWebContentsNotFoundError({ tabId, webContentsId });
+    }
+    // The guest has to be embedded in one of our windows -- any of them, not
+    // just the first. Before any window has registered there is nothing to check
+    // the host against, so the guest is taken at its word.
+    if (registeredWindows.size > 0 && Option.isNone(yield* findHostWindow(wc))) {
       return yield* new PreviewWebContentsNotFoundError({ tabId, webContentsId });
     }
     const attached = yield* Ref.get(attachedRef);
@@ -4172,7 +4229,9 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     setAnnotationTheme,
     setAudioMuted,
     setColorScheme,
-    setMainWindow,
+    registerWindow,
+    unregisterWindow,
+    setMainWindow: registerWindow,
     startRecording,
     closePictureInPicture,
     stopRecording,
@@ -4484,6 +4543,13 @@ export const isPreviewAutomationInvalidSelectorError = Schema.is(
 export class PreviewManager extends Context.Service<
   PreviewManager,
   {
+    // Adds an app window to the set that may host preview guests. Every window
+    // registers itself; unregistration also happens automatically when the
+    // window emits `closed`.
+    readonly registerWindow: (window: BrowserWindow) => Effect.Effect<void, PreviewManagerError>;
+    readonly unregisterWindow: (window: BrowserWindow) => Effect.Effect<void>;
+    // Pre-multi-window name for {@link registerWindow}, kept so the existing
+    // call sites stay put across upstream merges.
     readonly setMainWindow: (window: BrowserWindow) => Effect.Effect<void, PreviewManagerError>;
     readonly getBrowserSession: (
       scope?: string,
@@ -4601,6 +4667,8 @@ export const make = Effect.gen(function* PreviewManagerMake() {
   );
 
   return PreviewManager.of({
+    registerWindow: operations.registerWindow,
+    unregisterWindow: operations.unregisterWindow,
     setMainWindow: operations.setMainWindow,
     getBrowserSession: Effect.fn("PreviewManager.getBrowserSession")(
       function* (scope, persistent, namespace) {

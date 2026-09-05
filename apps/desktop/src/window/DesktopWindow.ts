@@ -34,6 +34,7 @@ const TITLEBAR_COLOR = "#01000000"; // #00000000 does not work correctly on Linu
 const TITLEBAR_LIGHT_SYMBOL_COLOR = "#1f2937";
 const TITLEBAR_DARK_SYMBOL_COLOR = "#f8fafc";
 const MAIN_WINDOW_BOUNDS_PERSIST_DEBOUNCE_MS = 500;
+const SECONDARY_WINDOW_CASCADE_OFFSET = 24;
 const DEVELOPMENT_LOAD_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000] as const;
 // Renderer crash (usually V8 OOM on long sessions) recovery: reload after a
 // short delay, at most MAX_ATTEMPTS times per rolling WINDOW so a renderer
@@ -74,10 +75,20 @@ export type DesktopWindowError =
 
 export type MainWindowZoomDirection = "in" | "out" | "reset";
 
+// Window 1 is the "main" window: it owns bounds persistence, the splash
+// handoff, and the ElectronWindow main registration. Every other window is a
+// "secondary" — a second full client of the same backend, created only when the
+// user explicitly asks for one.
+export type DesktopWindowRole = "main" | "secondary";
+
 export class DesktopWindow extends Context.Service<
   DesktopWindow,
   {
     readonly createMain: Effect.Effect<Electron.BrowserWindow, DesktopWindowError>;
+    // Opens an additional app window alongside the main one. Gated on backend
+    // readiness (the same latch `createMainIfBackendReady` uses) so a menu click
+    // during boot is a no-op instead of a window pointing at nothing.
+    readonly createSecondary: Effect.Effect<void, DesktopWindowError>;
     readonly ensureMain: Effect.Effect<Electron.BrowserWindow, DesktopWindowError>;
     readonly revealOrCreateMain: Effect.Effect<Electron.BrowserWindow, DesktopWindowError>;
     readonly activate: Effect.Effect<void, DesktopWindowError>;
@@ -164,6 +175,33 @@ export function resolveInitialMainWindowBounds(
     displays.some((display) => windowFitsWithinDisplay(persistedBounds, display))
   ) {
     return persistedBounds;
+  }
+  return DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE;
+}
+
+// A secondary window opens cascaded off whichever window the user was looking
+// at, so it is obviously a new window rather than one hiding exactly behind the
+// other. The cascade is dropped when it would push the window off every
+// display, and the whole thing falls back to the default size when there is no
+// window to cascade from (or its bounds are unreadable).
+export function resolveSecondaryWindowBounds(
+  sourceBounds: DesktopAppSettings.DesktopWindowBounds | null,
+  displays: readonly DisplayBounds[],
+): DesktopAppSettings.DesktopWindowBounds | typeof DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE {
+  if (sourceBounds === null) {
+    return DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE;
+  }
+  const cascaded = {
+    x: sourceBounds.x + SECONDARY_WINDOW_CASCADE_OFFSET,
+    y: sourceBounds.y + SECONDARY_WINDOW_CASCADE_OFFSET,
+    width: sourceBounds.width,
+    height: sourceBounds.height,
+  };
+  if (displays.some((display) => windowFitsWithinDisplay(cascaded, display))) {
+    return cascaded;
+  }
+  if (displays.some((display) => windowFitsWithinDisplay(sourceBounds, display))) {
+    return sourceBounds;
   }
   return DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE;
 }
@@ -329,10 +367,32 @@ export const make = Effect.gen(function* () {
   const currentMainWindow = electronWindow.currentMainOrFirst.pipe(Effect.flatMap(withoutSplash));
   const focusedMainWindow = electronWindow.focusedMainOrFirst.pipe(Effect.flatMap(withoutSplash));
 
-  const createWindow = Effect.fn("desktop.window.createWindow")(function* (): Effect.fn.Return<
-    Electron.BrowserWindow,
-    DesktopWindowError
-  > {
+  // Bounds of the window the user is currently looking at, normalized the same
+  // way persisted bounds are. `null` when there is nothing to cascade from or
+  // the window reports bounds the domain schema rejects.
+  const focusedWindowBounds = Effect.gen(function* () {
+    const focused = yield* focusedMainWindow;
+    if (Option.isNone(focused) || focused.value.isDestroyed()) {
+      return null;
+    }
+    const window = focused.value;
+    const bounds =
+      window.isFullScreen() || window.isMaximized() || window.isMinimized()
+        ? window.getNormalBounds()
+        : window.getBounds();
+    return DesktopAppSettings.normalizeMainWindowBounds({
+      x: Math.round(bounds.x),
+      y: Math.round(bounds.y),
+      width: Math.round(bounds.width),
+      height: Math.round(bounds.height),
+    });
+  });
+
+  const createWindow = Effect.fn("desktop.window.createWindow")(function* (
+    role: DesktopWindowRole,
+  ): Effect.fn.Return<Electron.BrowserWindow, DesktopWindowError> {
+    const isMainWindow = role === "main";
+    yield* Effect.annotateCurrentSpan({ role });
     yield* previewManager.getBrowserSession();
     const applicationUrl = getDesktopUrl(environment.isDevelopment);
     const iconPaths = yield* assets.iconPaths;
@@ -356,9 +416,16 @@ export const make = Effect.gen(function* () {
         : yield* logWindowWarning("failed to read connected displays; using defaults", {
             cause: displayBoundsResult.cause,
           }).pipe(Effect.as<readonly Electron.Rectangle[]>([]));
-    const initialBounds = resolveInitialMainWindowBounds(persistedBounds, displayBounds);
-    const restoredPersistedBounds = persistedBounds !== null && initialBounds === persistedBounds;
-    if (persistedBounds !== null && initialBounds === DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE) {
+    const initialBounds = isMainWindow
+      ? resolveInitialMainWindowBounds(persistedBounds, displayBounds)
+      : resolveSecondaryWindowBounds(yield* focusedWindowBounds, displayBounds);
+    const restoredPersistedBounds =
+      isMainWindow && persistedBounds !== null && initialBounds === persistedBounds;
+    if (
+      isMainWindow &&
+      persistedBounds !== null &&
+      initialBounds === DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE
+    ) {
       yield* logWindowWarning("saved main window bounds could not be restored; using defaults");
     }
     const window = yield* electronWindow.create({
@@ -475,9 +542,16 @@ export const make = Effect.gen(function* () {
         fiber === undefined ? Effect.void : Fiber.join(fiber).pipe(Effect.asVoid),
       ),
     );
-    flushMainWindowBounds = flushBoundsPersist;
+    // Only the main window owns the single persisted `mainWindowBounds` record.
+    // A secondary window neither writes it nor takes over the flush the quit
+    // path drains, so closing one can never overwrite the main window's bounds.
+    if (isMainWindow) {
+      flushMainWindowBounds = flushBoundsPersist;
+    }
 
-    yield* previewManager.setMainWindow(window);
+    // Every window hosts its own preview guests, so every window registers. The
+    // manager drops it again on `closed`.
+    yield* previewManager.registerWindow(window);
     window.webContents.on("will-attach-webview", (event, webPreferences, params) => {
       if (
         typeof params.partition !== "string" ||
@@ -605,13 +679,15 @@ export const make = Effect.gen(function* () {
       event.preventDefault();
       window.setTitle(environment.displayName);
     });
-    window.on("resize", scheduleBoundsPersist);
-    window.on("move", scheduleBoundsPersist);
-    window.on("maximize", scheduleBoundsPersist);
-    window.on("unmaximize", scheduleBoundsPersist);
-    window.on("close", () => {
-      runFork(flushBoundsPersist);
-    });
+    if (isMainWindow) {
+      window.on("resize", scheduleBoundsPersist);
+      window.on("move", scheduleBoundsPersist);
+      window.on("maximize", scheduleBoundsPersist);
+      window.on("unmaximize", scheduleBoundsPersist);
+      window.on("close", () => {
+        runFork(flushBoundsPersist);
+      });
+    }
 
     if (environment.platform === "darwin") {
       window.on("enter-full-screen", () => {
@@ -754,7 +830,13 @@ export const make = Effect.gen(function* () {
         window.webContents.setBackgroundThrottling(true);
       }
       // Reveal the real window, then close the connecting splash (if any) so the
-      // two don't overlap and there's no blank gap between them.
+      // two don't overlap and there's no blank gap between them. A secondary
+      // window never touches the splash: it can only be opened once the main
+      // window is already up, so there is no splash left to dismiss.
+      if (!isMainWindow) {
+        void runPromise(electronWindow.reveal(window));
+        return;
+      }
       if (persistedSettings.mainWindowMaximized) {
         window.maximize();
       }
@@ -776,11 +858,21 @@ export const make = Effect.gen(function* () {
   });
 
   const createMain = Effect.gen(function* () {
-    const window = yield* createWindow();
+    const window = yield* createWindow("main");
     yield* electronWindow.setMain(window);
     yield* logWindowInfo("main window created");
     return window;
   }).pipe(Effect.withSpan("desktop.window.createMain"));
+
+  const createSecondary = Effect.gen(function* () {
+    const backendReady = yield* Ref.get(backendReadyRef);
+    if (!backendReady) {
+      yield* logWindowInfo("ignored new window request; backend is not ready");
+      return;
+    }
+    yield* createWindow("secondary");
+    yield* logWindowInfo("secondary window created");
+  }).pipe(Effect.withSpan("desktop.window.createSecondary"));
 
   const ensureMain = Effect.gen(function* () {
     const existingWindow = yield* currentMainWindow;
@@ -852,6 +944,7 @@ export const make = Effect.gen(function* () {
 
   return DesktopWindow.of({
     createMain,
+    createSecondary,
     ensureMain,
     revealOrCreateMain,
     activate: Effect.gen(function* () {
