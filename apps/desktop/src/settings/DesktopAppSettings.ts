@@ -28,6 +28,11 @@ export interface DesktopSettings {
   readonly linuxPasswordStore: LinuxPasswordStorePreference;
   readonly mainWindowBounds: DesktopWindowBounds | null;
   readonly mainWindowMaximized: boolean;
+  // The additional windows that were open when the app last quit, in the order
+  // they should reopen. Kept separate from the main window's bounds because a
+  // window the user closed on purpose is removed from here immediately, while
+  // the main window's record survives every close.
+  readonly secondaryWindows: readonly DesktopSecondaryWindow[];
   readonly serverExposureMode: DesktopServerExposureMode;
   readonly tailscaleServeEnabled: boolean;
   readonly tailscaleServePort: number;
@@ -72,10 +77,22 @@ export const DEFAULT_MAIN_WINDOW_SIZE = {
   height: 780,
 } as const;
 
+// One reopenable window: where it sat, and the client URL it was showing. The
+// URL is validated against the app's own origin before it is loaded, so a
+// hand-edited settings file cannot point a window at someone else's page.
+export const DesktopSecondaryWindowSchema = Schema.Struct({
+  bounds: DesktopWindowBoundsSchema,
+  url: Schema.NullOr(Schema.String),
+});
+export type DesktopSecondaryWindow = typeof DesktopSecondaryWindowSchema.Type;
+// A stray settings file must not be able to open hundreds of windows.
+export const MAX_RESTORED_SECONDARY_WINDOWS = 8;
+
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   linuxPasswordStore: DEFAULT_LINUX_PASSWORD_STORE,
   mainWindowBounds: null,
   mainWindowMaximized: false,
+  secondaryWindows: [],
   serverExposureMode: "local-only",
   tailscaleServeEnabled: false,
   tailscaleServePort: DEFAULT_TAILSCALE_SERVE_PORT,
@@ -97,6 +114,7 @@ const DesktopSettingsDocument = Schema.Struct({
   linuxPasswordStore: Schema.optionalKey(Schema.Unknown),
   mainWindowBounds: Schema.optionalKey(Schema.NullOr(DesktopWindowBoundsDocument)),
   mainWindowMaximized: Schema.optionalKey(Schema.Boolean),
+  secondaryWindows: Schema.optionalKey(Schema.Array(Schema.Unknown)),
   serverExposureMode: Schema.optionalKey(DesktopServerExposureModeSchema),
   tailscaleServeEnabled: Schema.optionalKey(Schema.Boolean),
   tailscaleServePort: Schema.optionalKey(Schema.Number),
@@ -118,7 +136,25 @@ const DesktopSettingsJson = fromLenientJson(DesktopSettingsDocument);
 const decodeDesktopSettingsJson = Schema.decodeEffect(DesktopSettingsJson);
 const encodeDesktopSettingsJson = Schema.encodeEffect(DesktopSettingsJson);
 const decodeDesktopWindowBounds = Schema.decodeUnknownOption(DesktopWindowBoundsSchema);
+const decodeDesktopSecondaryWindow = Schema.decodeUnknownOption(DesktopSecondaryWindowSchema);
 const desktopWindowBoundsEquivalence = Schema.toEquivalence(DesktopWindowBoundsSchema);
+
+function secondaryWindowsEqual(
+  left: readonly DesktopSecondaryWindow[],
+  right: readonly DesktopSecondaryWindow[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((window, index) => {
+      const other = right[index];
+      return (
+        other !== undefined &&
+        window.url === other.url &&
+        desktopWindowBoundsEquivalence(window.bounds, other.bounds)
+      );
+    })
+  );
+}
 
 const settingsChange = (settings: DesktopSettings, changed: boolean): DesktopSettingsChange => ({
   settings,
@@ -155,6 +191,9 @@ export class DesktopAppSettings extends Context.Service<
     readonly setMainWindowBounds: (
       bounds: DesktopWindowBounds,
       isMaximized: boolean,
+    ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
+    readonly setSecondaryWindows: (
+      windows: readonly DesktopSecondaryWindow[],
     ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
     readonly setServerExposureMode: (
       mode: DesktopServerExposureMode,
@@ -204,6 +243,24 @@ export function normalizeMainWindowBounds(value: unknown): DesktopWindowBounds |
   return Option.getOrNull(decodeDesktopWindowBounds(value));
 }
 
+// A settings file we cannot make sense of means "no extra windows", never an
+// error and never a window opened from a value we could not read. Entries that
+// individually fail the schema are dropped; the rest still reopen.
+export function normalizeSecondaryWindows(value: unknown): readonly DesktopSecondaryWindow[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const windows: DesktopSecondaryWindow[] = [];
+  for (const entry of value) {
+    if (windows.length >= MAX_RESTORED_SECONDARY_WINDOWS) break;
+    const decoded = decodeDesktopSecondaryWindow(entry);
+    if (Option.isSome(decoded)) {
+      windows.push(decoded.value);
+    }
+  }
+  return windows;
+}
+
 function normalizeDesktopSettingsDocument(
   parsed: DesktopSettingsDocument,
   appVersion: string,
@@ -227,6 +284,7 @@ function normalizeDesktopSettingsDocument(
     linuxPasswordStore: normalizeLinuxPasswordStorePreference(parsed.linuxPasswordStore),
     mainWindowBounds,
     mainWindowMaximized: mainWindowBounds !== null && parsed.mainWindowMaximized === true,
+    secondaryWindows: normalizeSecondaryWindows(parsed.secondaryWindows),
     serverExposureMode:
       parsed.serverExposureMode === "network-accessible" ? "network-accessible" : "local-only",
     tailscaleServeEnabled: parsed.tailscaleServeEnabled === true,
@@ -255,6 +313,9 @@ function toDesktopSettingsDocument(
   }
   if (settings.mainWindowMaximized) {
     document.mainWindowMaximized = true;
+  }
+  if (settings.secondaryWindows.length > 0) {
+    document.secondaryWindows = settings.secondaryWindows;
   }
   if (settings.serverExposureMode !== defaults.serverExposureMode) {
     document.serverExposureMode = settings.serverExposureMode;
@@ -309,6 +370,19 @@ function setMainWindowBounds(
         ...settings,
         mainWindowBounds: bounds,
         mainWindowMaximized: isMaximized,
+      };
+}
+
+function setSecondaryWindows(
+  settings: DesktopSettings,
+  windows: readonly DesktopSecondaryWindow[],
+): DesktopSettings {
+  const capped = windows.slice(0, MAX_RESTORED_SECONDARY_WINDOWS);
+  return secondaryWindowsEqual(settings.secondaryWindows, capped)
+    ? settings
+    : {
+        ...settings,
+        secondaryWindows: capped,
       };
 }
 
@@ -518,6 +592,12 @@ export const make = Effect.gen(function* () {
           },
         }),
       ),
+    setSecondaryWindows: (windows) =>
+      persist((settings) => setSecondaryWindows(settings, windows)).pipe(
+        Effect.withSpan("desktop.settings.setSecondaryWindows", {
+          attributes: { count: windows.length },
+        }),
+      ),
     setServerExposureMode: (mode) =>
       persist((settings) => setServerExposureMode(settings, mode)).pipe(
         Effect.withSpan("desktop.settings.setServerExposureMode", { attributes: { mode } }),
@@ -577,6 +657,8 @@ export const layerTest = (initialSettings: DesktopSettings = DEFAULT_DESKTOP_SET
         load: SynchronizedRef.get(settingsRef),
         setMainWindowBounds: (bounds, isMaximized) =>
           update((settings) => setMainWindowBounds(settings, bounds, isMaximized)),
+        setSecondaryWindows: (windows) =>
+          update((settings) => setSecondaryWindows(settings, windows)),
         setServerExposureMode: (mode) =>
           update((settings) => setServerExposureMode(settings, mode)),
         setTailscaleServe: (input) => update((settings) => setTailscaleServe(settings, input)),
