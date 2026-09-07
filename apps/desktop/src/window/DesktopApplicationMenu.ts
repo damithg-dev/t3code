@@ -182,12 +182,6 @@ export const make = Effect.gen(function* () {
       {
         label: "File",
         submenu: [
-          {
-            label: "New Window",
-            accelerator: "CmdOrCtrl+Shift+N",
-            click: newWindowClick,
-          },
-          { type: "separator" },
           ...(environment.platform === "darwin"
             ? []
             : [
@@ -228,7 +222,25 @@ export const make = Effect.gen(function* () {
           { role: "togglefullscreen" },
         ],
       },
-      { role: "windowMenu" },
+      {
+        // Keeping the `windowMenu` role is what makes macOS treat this as the
+        // Window menu and append the list of open windows; only the submenu is
+        // replaced, so "New Window" sits above the stock items it belongs with.
+        role: "windowMenu",
+        submenu: [
+          {
+            label: "New Window",
+            accelerator: "CmdOrCtrl+Shift+N",
+            click: newWindowClick,
+          },
+          { type: "separator" },
+          { role: "minimize" },
+          { role: "zoom" },
+          ...(environment.platform === "darwin"
+            ? [{ type: "separator" as const }, { role: "front" as const }]
+            : [{ role: "close" as const }]),
+        ],
+      },
       {
         role: "help",
         submenu: [

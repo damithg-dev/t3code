@@ -25,6 +25,7 @@ const DesktopSettingsPatch = Schema.Struct({
     ),
   ),
   mainWindowMaximized: Schema.optionalKey(Schema.Boolean),
+  secondaryWindows: Schema.optionalKey(Schema.Array(Schema.Unknown)),
   serverExposureMode: Schema.optionalKey(Schema.Literals(["local-only", "network-accessible"])),
   tailscaleServeEnabled: Schema.optionalKey(Schema.Boolean),
   tailscaleServePort: Schema.optionalKey(Schema.Number),
@@ -108,6 +109,7 @@ describe("DesktopSettings", () => {
         linuxPasswordStore: "auto",
         mainWindowBounds: null,
         mainWindowMaximized: false,
+        secondaryWindows: [],
         serverExposureMode: "local-only",
         tailscaleServeEnabled: false,
         tailscaleServePort: 443,
@@ -137,6 +139,7 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "gnome-libsecret",
           mainWindowBounds: null,
           mainWindowMaximized: false,
+          secondaryWindows: [],
           serverExposureMode: "network-accessible",
           tailscaleServeEnabled: true,
           tailscaleServePort: 8443,
@@ -244,6 +247,7 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "auto",
           mainWindowBounds: { x: 120, y: 80, width: 1280, height: 900 },
           mainWindowMaximized: false,
+          secondaryWindows: [],
           serverExposureMode: "network-accessible",
           tailscaleServeEnabled: true,
           tailscaleServePort: 8443,
@@ -275,6 +279,50 @@ describe("DesktopSettings", () => {
     ),
   );
 
+  it.effect("round-trips the set of windows to reopen and drops entries it cannot read", () =>
+    withSettings(
+      Effect.gen(function* () {
+        const environment = yield* DesktopEnvironment.DesktopEnvironment;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const settings = yield* DesktopAppSettings.DesktopAppSettings;
+        const first = {
+          bounds: { x: 120, y: 80, width: 1280, height: 900 },
+          url: "t3code://app/#/projects/one",
+        };
+        const second = { bounds: { x: 200, y: 140, width: 900, height: 700 }, url: null };
+
+        const saved = yield* settings.setSecondaryWindows([first, second]);
+        assert.isTrue(saved.changed);
+        assert.deepEqual(saved.settings.secondaryWindows, [first, second]);
+        // Writing the same set again is not a change, so it never rewrites the file.
+        assert.isFalse((yield* settings.setSecondaryWindows([first, second])).changed);
+
+        const persisted = yield* decodeDesktopSettingsPatch(
+          yield* fileSystem.readFileString(environment.desktopSettingsPath),
+        );
+        assert.deepEqual(persisted.secondaryWindows, [first, second]);
+        assert.deepEqual(yield* settings.load, {
+          ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
+          secondaryWindows: [first, second],
+        } satisfies DesktopAppSettings.DesktopSettings);
+
+        // A window whose bounds fail the domain schema is dropped; its
+        // neighbours still reopen.
+        yield* writeSettingsPatch({
+          secondaryWindows: [{ bounds: { x: 0, y: 0, width: 10, height: 10 }, url: null }, second],
+        });
+        assert.deepEqual((yield* settings.load).secondaryWindows, [second]);
+
+        // A value that is not a list at all means "no extra windows", not a failure.
+        yield* fileSystem.writeFileString(
+          environment.desktopSettingsPath,
+          `{ "secondaryWindows": "nope" }\n`,
+        );
+        assert.deepEqual((yield* settings.load).secondaryWindows, []);
+      }),
+    ),
+  );
+
   it.effect(
     "normalizes unsupported linux password-store values without dropping other settings",
     () =>
@@ -300,6 +348,7 @@ describe("DesktopSettings", () => {
             linuxPasswordStore: "auto",
             mainWindowBounds: null,
             mainWindowMaximized: false,
+            secondaryWindows: [],
             serverExposureMode: "network-accessible",
             tailscaleServeEnabled: true,
             tailscaleServePort: 8443,
@@ -348,6 +397,7 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "auto",
           mainWindowBounds: null,
           mainWindowMaximized: false,
+          secondaryWindows: [],
           serverExposureMode: "local-only",
           tailscaleServeEnabled: false,
           tailscaleServePort: 443,
@@ -376,6 +426,7 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "auto",
           mainWindowBounds: null,
           mainWindowMaximized: false,
+          secondaryWindows: [],
           serverExposureMode: "local-only",
           tailscaleServeEnabled: false,
           tailscaleServePort: 443,
@@ -403,6 +454,7 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "auto",
           mainWindowBounds: null,
           mainWindowMaximized: false,
+          secondaryWindows: [],
           serverExposureMode: "local-only",
           tailscaleServeEnabled: true,
           tailscaleServePort: 443,
