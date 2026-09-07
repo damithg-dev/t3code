@@ -67,6 +67,7 @@ import Migration0051 from "./Migrations/051_ProjectionProjectsWorkspaceFile.ts";
 import Migration0052 from "./Migrations/052_ProjectionCheckpointRefs.ts";
 import Migration0053 from "./Migrations/053_ProjectionThreadsWorktrees.ts";
 import Migration0054 from "./Migrations/054_HealSkippedRenumberedMigrations.ts";
+import Migration0055 from "./Migrations/055_HealForkRenumberedMigrations.ts";
 import Migration0056 from "./Migrations/056_ProjectionThreadSessionsRateLimitResetsAt.ts";
 
 /**
@@ -144,6 +145,7 @@ export const migrationEntries = [
   [52, "ProjectionCheckpointRefs", Migration0052],
   [53, "ProjectionThreadsWorktrees", Migration0053],
   [54, "HealSkippedRenumberedMigrations", Migration0054],
+  [55, "HealForkRenumberedMigrations", Migration0055],
   [56, "ProjectionThreadSessionsRateLimitResetsAt", Migration0056],
 ] as const;
 
