@@ -73,6 +73,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           project_id,
           title,
           workspace_root,
+          workspace_file,
           default_model_selection_json,
           scripts_json,
           created_at,
@@ -83,6 +84,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           'project-1',
           'Project 1',
           '/tmp/project-1',
+          '/tmp/project-1/project-1.code-workspace',
           '{"provider":"codex","model":"gpt-5-codex"}',
           '[{"id":"script-1","name":"Build","command":"bun run build","icon":"build","runOnWorktreeCreate":false}]',
           '2026-02-24T00:00:00.000Z',
@@ -295,7 +297,10 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           id: asProjectId("project-1"),
           title: "Project 1",
           workspaceRoot: "/tmp/project-1",
+          workspaceFile: "/tmp/project-1/project-1.code-workspace",
+          repoRoots: ["/tmp/project-1"],
           repositoryIdentity: null,
+          repositoryIdentities: [],
           defaultModelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -338,6 +343,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             url: "https://github.com/pingdotgg/t3code/pull/42",
           },
           branchPullRequest,
+          worktrees: [],
           latestTurn: {
             turnId: asTurnId("turn-1"),
             state: "completed",
@@ -426,7 +432,10 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           id: asProjectId("project-1"),
           title: "Project 1",
           workspaceRoot: "/tmp/project-1",
+          workspaceFile: "/tmp/project-1/project-1.code-workspace",
+          repoRoots: ["/tmp/project-1"],
           repositoryIdentity: null,
+          repositoryIdentities: [],
           defaultModelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -468,6 +477,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             url: "https://github.com/pingdotgg/t3code/pull/42",
           },
           branchPullRequest,
+          worktrees: [],
           latestTurn: {
             turnId: asTurnId("turn-1"),
             state: "completed",
@@ -1042,6 +1052,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           project_id,
           title,
           workspace_root,
+          workspace_file,
           default_model_selection_json,
           scripts_json,
           created_at,
@@ -1053,6 +1064,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             'project-active',
             'Active Project',
             '/tmp/workspace',
+            '/tmp/workspace/active.code-workspace',
             '{"provider":"codex","model":"gpt-5-codex"}',
             '[]',
             '2026-03-01T00:00:00.000Z',
@@ -1063,6 +1075,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             'project-deleted',
             'Deleted Project',
             '/tmp/deleted',
+            NULL,
             NULL,
             '[]',
             '2026-03-01T00:00:02.000Z',
@@ -1145,6 +1158,15 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         assert.equal(project._tag, "Some");
         if (project._tag === "Some") {
           assert.equal(project.value.id, asProjectId("project-active"));
+          assert.equal(project.value.workspaceFile, "/tmp/workspace/active.code-workspace");
+        }
+
+        const projectShell = yield* snapshotQuery.getProjectShellById(
+          asProjectId("project-active"),
+        );
+        assert.equal(projectShell._tag, "Some");
+        if (projectShell._tag === "Some") {
+          assert.equal(projectShell.value.workspaceFile, "/tmp/workspace/active.code-workspace");
         }
 
         const missingProject = yield* snapshotQuery.getActiveProjectByWorkspaceRoot("/tmp/missing");
@@ -1332,7 +1354,9 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           threadId: ThreadId.make("thread-context"),
           projectId: asProjectId("project-context"),
           workspaceRoot: "/tmp/context-workspace",
+          repoRoots: ["/tmp/context-workspace"],
           worktreePath: "/tmp/context-worktree",
+          worktrees: [],
           checkpoints: [
             {
               turnId: asTurnId("turn-1"),
@@ -2230,6 +2254,35 @@ it.effect(
                 },
                 rootPath: cwd,
               };
+            }),
+          resolveMany: (cwds: ReadonlyArray<string>) =>
+            Effect.sync(() => {
+              const seen = new Set<string>();
+              const result: Array<{
+                readonly canonicalKey: string;
+                readonly locator: {
+                  readonly source: "git-remote";
+                  readonly remoteName: string;
+                  readonly remoteUrl: string;
+                };
+                readonly rootPath: string;
+              }> = [];
+              for (const cwd of cwds) {
+                resolveCalls.push(cwd);
+                const canonicalKey = `github.com/acme${cwd}`;
+                if (seen.has(canonicalKey)) continue;
+                seen.add(canonicalKey);
+                result.push({
+                  canonicalKey,
+                  locator: {
+                    source: "git-remote",
+                    remoteName: "origin",
+                    remoteUrl: `https://github.com/acme${cwd}.git`,
+                  },
+                  rootPath: cwd,
+                });
+              }
+              return result;
             }),
         }),
       ),

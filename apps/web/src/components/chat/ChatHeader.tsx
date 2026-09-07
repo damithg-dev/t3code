@@ -23,6 +23,7 @@ import {
 } from "react";
 import GitActionsControl from "../GitActionsControl";
 import { isTrailingDoubleClick } from "../Sidebar.logic";
+import { MultiRepoGitControl, type MultiRepoGitGroup } from "./MultiRepoGitControl";
 import { type DraftId } from "~/composerDraftStore";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
@@ -59,6 +60,8 @@ interface ChatHeaderProps {
   activeProjectFaviconPath: string | null;
   activeProjectIcon: import("@t3tools/contracts").ProjectIconOverride | null;
   openInCwd: string | null;
+  /** The project's `.code-workspace` file, when opening it makes sense (see {@link OpenInPicker}). */
+  openInWorkspaceFile: string | null;
   activeProjectScripts: ReadonlyArray<ProjectScript> | undefined;
   preferredScriptId: string | null;
   keybindings: ResolvedKeybindingsConfig;
@@ -68,6 +71,12 @@ interface ChatHeaderProps {
   readonly onOpenPullRequest?: ((number: number) => void) | undefined;
   onNewThreadInProject: () => void;
   onOpenProjectSettings?: (() => void) | undefined;
+  /**
+   * Git repo roots to surface status/actions for. When more than one, render a
+   * single consolidated {@link MultiRepoGitControl} (multi-repo workspace);
+   * otherwise the single `gitCwd` control is shown unchanged.
+   */
+  repoStatusGroups: ReadonlyArray<MultiRepoGitGroup>;
   onRunProjectScript: (script: ProjectScript) => void;
   onAddProjectScript: (input: NewProjectScriptInput) => Promise<ProjectScriptActionResult>;
   onUpdateProjectScript: (
@@ -131,6 +140,7 @@ export const ChatHeader = memo(function ChatHeader({
   activeProjectFaviconPath,
   activeProjectIcon,
   openInCwd,
+  openInWorkspaceFile,
   activeProjectScripts,
   preferredScriptId,
   keybindings,
@@ -140,6 +150,7 @@ export const ChatHeader = memo(function ChatHeader({
   onOpenPullRequest,
   onNewThreadInProject,
   onOpenProjectSettings,
+  repoStatusGroups,
   onRunProjectScript,
   onAddProjectScript,
   onUpdateProjectScript,
@@ -437,16 +448,26 @@ export const ChatHeader = memo(function ChatHeader({
             keybindings={keybindings}
             availableEditors={availableEditors}
             openInCwd={openInCwd}
+            openInWorkspaceFile={openInWorkspaceFile}
           />
         )}
-        {activeProjectName && (
-          <GitActionsControl
-            gitCwd={gitCwd}
-            activeThreadRef={scopeThreadRef(activeThreadEnvironmentId, activeThreadId)}
-            onOpenPullRequest={onOpenPullRequest}
-            {...(draftId ? { draftId } : {})}
-          />
-        )}
+        {activeProjectName &&
+          (repoStatusGroups.length > 1 ? (
+            <MultiRepoGitControl
+              groups={repoStatusGroups}
+              environmentId={activeThreadEnvironmentId}
+              activeThreadRef={scopeThreadRef(activeThreadEnvironmentId, activeThreadId)}
+              onOpenPullRequest={onOpenPullRequest}
+              {...(draftId ? { draftId } : {})}
+            />
+          ) : (
+            <GitActionsControl
+              gitCwd={gitCwd}
+              activeThreadRef={scopeThreadRef(activeThreadEnvironmentId, activeThreadId)}
+              onOpenPullRequest={onOpenPullRequest}
+              {...(draftId ? { draftId } : {})}
+            />
+          ))}
       </div>
     </div>
   );
