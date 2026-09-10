@@ -250,19 +250,30 @@ const makeTestHostWebContents = (id = 7): TestHostWebContents => {
   };
 };
 
-/** An app window whose own webContents is `host`, so guests embedded in it resolve back to it. */
+/**
+ * An app window whose own webContents is `host`, so guests embedded in it resolve back to it.
+ * `close` reproduces Electron's ordering: the window is destroyed first, and everything but
+ * `isDestroyed` throws from then on, so `closed` handlers cannot read anything off it.
+ */
 const makeTestAppWindow = (host: TestHostWebContents) => {
   const listeners = new Map<string, () => void>();
+  let destroyed = false;
   return {
     host,
     window: {
-      isDestroyed: () => false,
+      isDestroyed: () => destroyed,
       once: vi.fn((event: string, listener: () => void) => {
         listeners.set(event, listener);
       }),
-      webContents: host,
+      get webContents() {
+        if (destroyed) throw new TypeError("Object has been destroyed");
+        return host;
+      },
     } as never,
-    close: () => listeners.get("closed")?.(),
+    close: () => {
+      destroyed = true;
+      listeners.get("closed")?.();
+    },
   };
 };
 
@@ -4185,6 +4196,36 @@ describe("PreviewManager", () => {
         // no longer attach -- and the surviving window never inherits it.
         yield* manager.createTab("tab_after_close");
         const rejected = yield* Effect.exit(manager.registerWebview("tab_after_close", 43));
+        expect(Exit.isFailure(rejected)).toBe(true);
+      }),
+    ),
+  );
+
+  effectIt.effect("unregisters a closed window without reading it back", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const capturePage = vi.fn(async () => ({
+          toJPEG: () => Buffer.from("frame"),
+          getSize: () => ({ width: 1280, height: 720 }),
+        }));
+        const survivor = makeTestAppWindow(makeTestHostWebContents(7));
+        const closing = makeTestAppWindow(makeTestHostWebContents(8));
+        fromId.mockReturnValue(makeTestPreviewWebContents(capturePage, 42, closing.host));
+
+        yield* manager.registerWindow(survivor.window);
+        yield* manager.registerWindow(closing.window);
+
+        // Electron destroys the window before it emits `closed`, so a close path
+        // that reads its webContents throws straight out of the event listener
+        // and crashes the main process.
+        expect(() => {
+          closing.close();
+        }).not.toThrow();
+        yield* Effect.yieldNow;
+
+        // ...and it still left the registry, so its guests cannot attach again.
+        yield* manager.createTab("tab_after_close");
+        const rejected = yield* Effect.exit(manager.registerWebview("tab_after_close", 42));
         expect(Exit.isFailure(rejected)).toBe(true);
       }),
     ),

@@ -815,12 +815,16 @@ export const make = Effect.gen(function* () {
     }
 
     if (environment.platform === "darwin") {
-      window.on("enter-full-screen", () => {
-        window.webContents.send(WINDOW_FULLSCREEN_STATE_CHANNEL, true);
-      });
-      window.on("leave-full-screen", () => {
-        window.webContents.send(WINDOW_FULLSCREEN_STATE_CHANNEL, false);
-      });
+      // macOS animates the fullscreen transition, so a window closed (or dropped
+      // out of fullscreen by the pending-quit conceal) while fullscreen can emit
+      // `leave-full-screen` after Electron has destroyed it. Reading
+      // `.webContents` off a destroyed window throws.
+      const sendFullscreenState = (fullscreen: boolean) => () => {
+        if (window.isDestroyed()) return;
+        window.webContents.send(WINDOW_FULLSCREEN_STATE_CHANNEL, fullscreen);
+      };
+      window.on("enter-full-screen", sendFullscreenState(true));
+      window.on("leave-full-screen", sendFullscreenState(false));
     }
 
     let developmentLoadRetryIndex = 0;
@@ -1162,6 +1166,9 @@ export const make = Effect.gen(function* () {
         return;
       }
       const targetWindow = Option.isSome(existingWindow) ? existingWindow.value : yield* ensureMain;
+      // The window was live when it was looked up, but every step since then is
+      // a suspension point the user can close it across.
+      if (targetWindow.isDestroyed()) return;
 
       const send = () => {
         if (targetWindow.isDestroyed()) return;

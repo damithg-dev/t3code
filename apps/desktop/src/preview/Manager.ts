@@ -1946,15 +1946,17 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   // holder of its id was already replaced and is ignored. Preview work is torn
   // down only once the last window is gone: doing it per window would kill the
   // recordings and picture-in-picture of the windows that are still open.
-  const unregisterWindowUnsafe = (window: BrowserWindow): void => {
+  // `registeredKey` is the id captured when the window was registered, and is
+  // required rather than read back here: Electron destroys a window before it
+  // emits `closed`, and a destroyed window throws on `.webContents`.
+  const unregisterWindowUnsafe = (window: BrowserWindow, registeredKey: number): void => {
     const removed = runSync(
       Ref.modify(windowsRef, (windows) => {
-        const key = window.webContents.id;
-        if (windows.get(key) !== window) return [false, windows] as const;
+        if (windows.get(registeredKey) !== window) return [false, windows] as const;
         return [
           true,
           replaceMap(windows, (copy) => {
-            copy.delete(key);
+            copy.delete(registeredKey);
           }),
         ] as const;
       }),
@@ -1981,23 +1983,27 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         if (sessions.size > 0) {
           yield* setWindowBackgroundThrottling(window, false);
         }
+        const registeredKey = window.webContents.id;
         yield* Ref.update(windowsRef, (windows) =>
           replaceMap(windows, (copy) => {
-            copy.set(window.webContents.id, window);
+            copy.set(registeredKey, window);
           }),
         );
         frameCaptureWindowOpen = true;
         window.once("closed", () => {
-          unregisterWindowUnsafe(window);
+          unregisterWindowUnsafe(window, registeredKey);
         });
         return [undefined, sessions] as const;
       }),
     ).pipe(Effect.uninterruptible);
   });
 
+  // Explicit unregistration only ever happens while the window is still alive;
+  // once it is destroyed its own `closed` handler has already dropped it.
   const unregisterWindow = (window: BrowserWindow) =>
     Effect.sync(() => {
-      unregisterWindowUnsafe(window);
+      if (window.isDestroyed()) return;
+      unregisterWindowUnsafe(window, window.webContents.id);
     });
 
   const createTabUnlocked = Effect.fn("PreviewManager.createTabUnlocked")(function* (
